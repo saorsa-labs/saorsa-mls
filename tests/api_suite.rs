@@ -4,7 +4,7 @@ use saorsa_mls::{CipherSuite, CipherSuiteId, GroupConfig, MemberId, MemberIdenti
 fn api_group_new_uses_requested_suite() {
     let rt = tokio::runtime::Runtime::new().expect("runtime");
     rt.block_on(async {
-        let suite_id = CipherSuiteId::MLS_256_MLKEM1024_AES256GCM_SHA512_MLDSA87;
+        let suite_id = CipherSuiteId::SPEC2_MLS_256_MLKEM1024_CHACHA20POLY1305_SHA512_MLDSA87;
         let suite = CipherSuite::from_id(suite_id).expect("suite registered");
 
         let creator = MemberIdentity::generate_with_suite(MemberId::generate(), suite)
@@ -25,7 +25,7 @@ fn api_group_new_uses_requested_suite() {
 fn api_add_member_rejects_suite_mismatch() {
     let rt = tokio::runtime::Runtime::new().expect("runtime");
     rt.block_on(async {
-        let suite_id = CipherSuiteId::MLS_256_MLKEM1024_AES256GCM_SHA512_MLDSA87;
+        let suite_id = CipherSuiteId::SPEC2_MLS_256_MLKEM1024_CHACHA20POLY1305_SHA512_MLDSA87;
         let suite = CipherSuite::from_id(suite_id).expect("suite registered");
 
         let creator = MemberIdentity::generate_with_suite(MemberId::generate(), suite)

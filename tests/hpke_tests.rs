@@ -9,6 +9,9 @@
 //! - Context export for key derivation
 //! - Integration with MLS Welcome messages
 //! - All HPKE modes (Base, PSK, Auth, AuthPSK)
+//!
+// Allow deprecated cipher suite IDs - this test file validates SPEC-PROD suites for backward compatibility
+#![allow(deprecated)]
 
 use saorsa_mls::crypto::{CipherSuite, CipherSuiteId, KeyPair};
 
@@ -43,8 +46,10 @@ fn test_hpke_seal_open_mlkem768() {
 /// Test HPKE with ML-KEM1024 (high security)
 #[test]
 fn test_hpke_seal_open_mlkem1024() {
-    let suite = CipherSuite::from_id(CipherSuiteId::MLS_256_MLKEM1024_AES256GCM_SHA512_MLDSA87)
-        .expect("valid ciphersuite");
+    let suite = CipherSuite::from_id(
+        CipherSuiteId::SPEC2_MLS_256_MLKEM1024_CHACHA20POLY1305_SHA512_MLDSA87,
+    )
+    .expect("valid ciphersuite");
 
     let recipient = KeyPair::generate(suite);
     let plaintext = b"High security message";

@@ -6,6 +6,9 @@
 //! Both specifications require:
 //! - Log ciphersuite negotiation for audit
 //! - Log negotiation artifacts
+//!
+// Allow deprecated cipher suite IDs - this test file validates backward compatibility
+#![allow(deprecated)]
 
 use saorsa_mls::{CipherSuiteId, GroupConfig, MemberId, MemberIdentity, MlsGroup};
 
@@ -61,11 +64,9 @@ async fn test_audit_log_records_pqc_status() {
 /// Test that deprecated suites are logged as such
 #[tokio::test]
 async fn test_audit_log_marks_deprecated_suites() {
-    #[allow(deprecated)]
     let deprecated_config = GroupConfig::default()
         .with_cipher_suite(CipherSuiteId::MLS_128_MLKEM768_AES128GCM_SHA256_MLDSA65);
 
-    #[allow(deprecated)]
     let suite =
         saorsa_mls::CipherSuite::from_id(CipherSuiteId::MLS_128_MLKEM768_AES128GCM_SHA256_MLDSA65)
             .expect("suite exists");

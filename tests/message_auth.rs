@@ -78,8 +78,10 @@ async fn welcome_message_signature_matches_payload() {
 fn handshake_message_signature_matches_payload() {
     use saorsa_mls::crypto::SignatureKey;
 
-    let suite = CipherSuite::from_id(CipherSuiteId::MLS_256_MLKEM1024_AES256GCM_SHA512_MLDSA87)
-        .expect("suite");
+    let suite = CipherSuite::from_id(
+        CipherSuiteId::SPEC2_MLS_256_MLKEM1024_CHACHA20POLY1305_SHA512_MLDSA87,
+    )
+    .expect("suite");
     let keypair = KeyPair::generate(suite);
     let sender = MemberId::generate();
     let content = b"handshake payload".to_vec();

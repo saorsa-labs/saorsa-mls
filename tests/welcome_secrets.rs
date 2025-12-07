@@ -1,8 +1,10 @@
 use saorsa_mls::{CipherSuite, CipherSuiteId, GroupConfig, MemberId, MemberIdentity, MlsGroup};
 #[tokio::test]
 async fn welcome_decapsulation_yields_nonzero_secret() {
-    let suite = CipherSuite::from_id(CipherSuiteId::MLS_256_MLKEM1024_AES256GCM_SHA512_MLDSA87)
-        .expect("suite");
+    let suite = CipherSuite::from_id(
+        CipherSuiteId::SPEC2_MLS_256_MLKEM1024_CHACHA20POLY1305_SHA512_MLDSA87,
+    )
+    .expect("suite");
     let config = GroupConfig::default().with_cipher_suite(suite.id());
 
     let creator =

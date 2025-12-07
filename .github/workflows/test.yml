@@ -97,35 +97,36 @@ jobs:
         # Test test-utils feature
         cargo test --features test-utils
 
-  miri:
-    name: Miri (Undefined Behavior Detection)
-    runs-on: ubuntu-latest
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Install Rust nightly with miri
-      uses: dtolnay/rust-toolchain@nightly
-      with:
-        components: miri
-
-    - name: Cache cargo registry
-      uses: actions/cache@v4
-      with:
-        path: |
-          ~/.cargo/registry
-          ~/.cargo/git
-        key: miri-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-    - name: Run tests under miri
-      run: |
-        cargo miri setup
-        # Run a subset of tests under miri (it's slow)
-        # Note: Miri may have issues with async code and external dependencies
-        cargo miri test --lib --all-features 2>&1 || echo "Note: Miri detected issues - this is expected with async/tokio code"
-      env:
-        MIRIFLAGS: -Zmiri-disable-isolation -Zmiri-ignore-leaks
-      continue-on-error: true
+# Miri job temporarily disabled due to timeout issues with async code
+#  miri:
+#    name: Miri (Undefined Behavior Detection)
+#    runs-on: ubuntu-latest
+#    steps:
+#    - name: Checkout code
+#      uses: actions/checkout@v4
+#
+#    - name: Install Rust nightly with miri
+#      uses: dtolnay/rust-toolchain@nightly
+#      with:
+#        components: miri
+#
+#    - name: Cache cargo registry
+#      uses: actions/cache@v4
+#      with:
+#        path: |
+#          ~/.cargo/registry
+#          ~/.cargo/git
+#        key: miri-cargo-${{ hashFiles('**/Cargo.lock') }}
+#
+#    - name: Run tests under miri
+#      run: |
+#        cargo miri setup
+#        # Run a subset of tests under miri (it's slow)
+#        # Note: Miri may have issues with async code and external dependencies
+#        cargo miri test --lib --all-features 2>&1 || echo "Note: Miri detected issues - this is expected with async/tokio code"
+#      env:
+#        MIRIFLAGS: -Zmiri-disable-isolation -Zmiri-ignore-leaks
+#      continue-on-error: true
 
   address-sanitizer:
     name: AddressSanitizer

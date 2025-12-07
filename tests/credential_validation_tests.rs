@@ -3,6 +3,9 @@
 
 //! Credential validation tests for production readiness
 //!
+// Allow deprecated cipher suite IDs for testing backward compatibility
+#![allow(deprecated)]
+//!
 //! Tests comprehensive credential validation with ML-DSA signatures
 //! as required by SPEC-PROD.md for production deployment.
 //!
@@ -18,6 +21,7 @@
 //! - Trust anchor management and verification
 //! - Policy enforcement (allowed ciphersuites, key usage)
 //! - Error handling for invalid credentials
+//!
 
 use saorsa_mls::{
     CipherSuite, CipherSuiteId, Credential, CredentialType, KeyPair, MemberId, TrustStore,
@@ -73,8 +77,10 @@ fn test_basic_credential_different_suites() {
         CipherSuite::from_id(CipherSuiteId::MLS_128_MLKEM768_CHACHA20POLY1305_SHA256_MLDSA65)
             .expect("valid suite");
 
-    let suite_256 = CipherSuite::from_id(CipherSuiteId::MLS_256_MLKEM1024_AES256GCM_SHA512_MLDSA87)
-        .expect("valid suite");
+    let suite_256 = CipherSuite::from_id(
+        CipherSuiteId::SPEC2_MLS_256_MLKEM1024_CHACHA20POLY1305_SHA512_MLDSA87,
+    )
+    .expect("valid suite");
 
     let kp_128 = KeyPair::generate(suite_128);
     let cred_128 = Credential::new_basic(member_id, None, &kp_128, suite_128)

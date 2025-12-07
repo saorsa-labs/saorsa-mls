@@ -1327,6 +1327,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // Testing backward compatibility with SPEC-PROD suite
     fn test_group_config_modification() {
         let config = GroupConfig {
             max_members: Some(100),

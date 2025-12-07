@@ -20,7 +20,7 @@ async fn test_slh_dsa_keypair_generation() {
         .expect("should generate SLH-DSA identity");
 
     // Verify the identity was created successfully
-    assert!(identity.id.as_bytes().len() > 0, "Should have member ID");
+    assert!(!identity.id.as_bytes().is_empty(), "Should have member ID");
 }
 
 /// Test that SLH-DSA works with MLS group

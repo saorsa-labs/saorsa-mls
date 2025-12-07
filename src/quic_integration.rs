@@ -89,7 +89,7 @@ impl QuicStreamManager {
         let mut stream_ids = self.stream_ids.write();
         stream_ids
             .entry(frame.group_id.clone())
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(Self::stream_for_frame_type(frame.frame_type));
 
         Ok(())

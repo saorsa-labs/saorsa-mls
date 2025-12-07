@@ -3,6 +3,9 @@
 
 //! FIPS 203/204 Known Answer Tests (KAT) for ML-KEM and ML-DSA
 //!
+// Allow deprecated cipher suite IDs - this test file validates SPEC-PROD suites for backward compatibility
+#![allow(deprecated)]
+//!
 //! These tests validate that our post-quantum cryptographic implementations
 //! match the official NIST FIPS specifications using test vectors.
 //!

@@ -19,17 +19,20 @@ fn default_suite_matches_spec2_pqc_only() {
 
 #[test]
 fn high_security_suite_is_registered() {
-    let suite = CipherSuite::from_id(CipherSuiteId::MLS_256_MLKEM1024_AES256GCM_SHA512_MLDSA87)
-        .expect("suite must be registered");
+    let suite = CipherSuite::from_id(
+        CipherSuiteId::SPEC2_MLS_256_MLKEM1024_CHACHA20POLY1305_SHA512_MLDSA87,
+    )
+    .expect("suite must be registered");
     assert_eq!(suite.kem(), MlsKem::MlKem1024);
     assert_eq!(suite.signature(), MlsSignature::MlDsa87);
-    assert_eq!(suite.aead(), MlsAead::Aes256Gcm);
+    // SPEC-2 suites use ChaCha20Poly1305, not AES-GCM
+    assert_eq!(suite.aead(), MlsAead::ChaCha20Poly1305);
     assert_eq!(suite.hash(), MlsHash::Sha512);
 }
 
 #[tokio::test]
 async fn mls_group_uses_requested_suite() {
-    let cipher_suite_id = CipherSuiteId::MLS_256_MLKEM1024_AES256GCM_SHA512_MLDSA87;
+    let cipher_suite_id = CipherSuiteId::SPEC2_MLS_256_MLKEM1024_CHACHA20POLY1305_SHA512_MLDSA87;
     let config = GroupConfig::default().with_cipher_suite(cipher_suite_id);
     let suite = CipherSuite::from_id(cipher_suite_id).expect("suite must exist");
 

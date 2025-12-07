@@ -160,22 +160,26 @@ impl GroupManager {
     /// Add a member to the group
     pub async fn add_member(&self, group_id: &GroupId, id: Identity) -> Result<Commit> {
         // We need to replace the group with a mutable one temporarily
-        let mut groups = self.groups.write();
-        let existing = groups
-            .get(group_id)
-            .ok_or_else(|| MlsError::InvalidGroupState("Group not found".to_string()))?;
+        // First, validate and remove under lock
+        let mut group = {
+            let mut groups = self.groups.write();
+            let existing = groups
+                .get(group_id)
+                .ok_or_else(|| MlsError::InvalidGroupState("Group not found".to_string()))?;
 
-        if id.cipher_suite() != existing.cipher_suite() {
-            return Err(MlsError::InvalidGroupState(
-                "member identity does not match group cipher suite".to_string(),
-            ));
-        }
+            if id.cipher_suite() != existing.cipher_suite() {
+                return Err(MlsError::InvalidGroupState(
+                    "member identity does not match group cipher suite".to_string(),
+                ));
+            }
 
-        let mut group = groups
-            .remove(group_id)
-            .expect("group must still exist after prior lookup");
+            groups
+                .remove(group_id)
+                .expect("group must still exist after prior lookup")
+            // Lock is released here when `groups` goes out of scope
+        };
 
-        // Get mutable reference and add member
+        // Get mutable reference and add member (lock is not held during await)
         let result = {
             let group_mut = Arc::get_mut(&mut group).ok_or_else(|| {
                 MlsError::InvalidGroupState("Cannot modify shared group".to_string())
@@ -184,9 +188,11 @@ impl GroupManager {
             group_mut.add_member(&id).await
         };
 
-        // Put the group back regardless of success/failure
-        groups.insert(group_id.clone(), group);
-        drop(groups);
+        // Put the group back under a new lock
+        {
+            let mut groups = self.groups.write();
+            groups.insert(group_id.clone(), group);
+        }
 
         let _welcome = result?;
 
@@ -196,7 +202,7 @@ impl GroupManager {
             storage.epoch += 1;
             storage
                 .ratchets
-                .insert(id.id.clone(), SecretBytes::from(random_bytes(32)));
+                .insert(id.id, SecretBytes::from(random_bytes(32)));
         }
         let _epoch = storages.get(group_id).map(|s| s.epoch).unwrap_or(0);
 
@@ -211,22 +217,26 @@ impl GroupManager {
     /// Remove a member from the group
     pub async fn remove_member(&self, group_id: &GroupId, id: Identity) -> Result<Commit> {
         // We need to replace the group with a mutable one temporarily
-        let mut groups = self.groups.write();
-        let existing = groups
-            .get(group_id)
-            .ok_or_else(|| MlsError::InvalidGroupState("Group not found".to_string()))?;
+        // First, validate and remove under lock
+        let mut group = {
+            let mut groups = self.groups.write();
+            let existing = groups
+                .get(group_id)
+                .ok_or_else(|| MlsError::InvalidGroupState("Group not found".to_string()))?;
 
-        if id.cipher_suite() != existing.cipher_suite() {
-            return Err(MlsError::InvalidGroupState(
-                "member identity does not match group cipher suite".to_string(),
-            ));
-        }
+            if id.cipher_suite() != existing.cipher_suite() {
+                return Err(MlsError::InvalidGroupState(
+                    "member identity does not match group cipher suite".to_string(),
+                ));
+            }
 
-        let mut group = groups
-            .remove(group_id)
-            .expect("group must still exist after prior lookup");
+            groups
+                .remove(group_id)
+                .expect("group must still exist after prior lookup")
+            // Lock is released here when `groups` goes out of scope
+        };
 
-        // Get mutable reference and remove member
+        // Get mutable reference and remove member (lock is not held during await)
         let result = {
             let group_mut = Arc::get_mut(&mut group).ok_or_else(|| {
                 MlsError::InvalidGroupState("Cannot modify shared group".to_string())
@@ -235,9 +245,11 @@ impl GroupManager {
             group_mut.remove_member(&id.id).await
         };
 
-        // Put the group back regardless of success/failure
-        groups.insert(group_id.clone(), group);
-        drop(groups);
+        // Put the group back under a new lock
+        {
+            let mut groups = self.groups.write();
+            groups.insert(group_id.clone(), group);
+        }
 
         result?;
 

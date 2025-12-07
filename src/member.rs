@@ -1,13 +1,11 @@
 //! Member identity and key management for MLS groups
 
 use crate::{
-    crypto::{CipherSuite, DebugMlDsaPublicKey, DebugMlDsaSignature, DebugSignature, KeyPair},
+    crypto::{CipherSuite, DebugSignature, KeyPair},
     MlsError, Result,
 };
 use bincode::Options;
-use saorsa_pqc::api::{
-    MlDsaPublicKey, MlDsaSecretKey, MlDsaSignature, MlKemSecretKey, SlhDsaSecretKey,
-};
+use saorsa_pqc::api::{MlDsaSecretKey, MlKemSecretKey, SlhDsaSecretKey};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;

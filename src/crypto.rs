@@ -178,6 +178,7 @@ impl CipherSuite {
 
     /// Get the ML-KEM variant for this cipher suite.
     #[must_use]
+    #[allow(deprecated)] // Must handle deprecated HybridX25519MlKem768 for backward compatibility
     pub fn ml_kem_variant(&self) -> MlKemVariant {
         match self.kem {
             MlsKem::MlKem512 => MlKemVariant::MlKem512,
@@ -260,6 +261,7 @@ impl CipherSuite {
     ///
     /// SPEC-2 requires rejecting any non-PQC suite and uses only ChaCha20Poly1305 AEAD.
     #[must_use]
+    #[allow(deprecated)] // Must check deprecated HybridX25519MlKem768 for backward compatibility
     pub fn is_pqc_only(&self) -> bool {
         // Check if using hybrid KEM (not allowed in SPEC-2)
         if matches!(self.kem, MlsKem::HybridX25519MlKem768) {
