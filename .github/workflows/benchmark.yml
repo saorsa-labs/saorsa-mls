@@ -107,7 +107,7 @@ jobs:
         echo "Date: $(date)" >> $GITHUB_STEP_SUMMARY
 
     - name: Upload benchmark results
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: benchmark-results
         path: target/criterion/
@@ -353,7 +353,7 @@ jobs:
         echo "Compile timing report generated. Check artifacts for detailed analysis." >> $GITHUB_STEP_SUMMARY
 
     - name: Upload timing report
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: compile-timings
         path: target/cargo-timings/*.html
