@@ -26,7 +26,7 @@ bincode = "1.3"
 saorsa-pqc = "0.3.14"
 
 # QUIC networking
-ant-quic = "0.10.4"
+ant-quic = "0.20.0"
 
 # ChaCha20-Poly1305 types (used by saorsa-pqc API)
 chacha20poly1305 = "0.10"
