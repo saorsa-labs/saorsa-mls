@@ -4,7 +4,7 @@ use crate::{
     crypto::{CipherSuite, DebugSignature, KeyPair},
     MlsError, Result,
 };
-use bincode::Options;
+// postcard serialization (bincode removed)
 use saorsa_pqc::api::{MlDsaSecretKey, MlKemSecretKey, SlhDsaSecretKey};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -264,8 +264,7 @@ impl Credential {
         }
 
         // Add cipher suite information
-        let suite_bytes = bincode::DefaultOptions::new()
-            .serialize(&suite)
+        let suite_bytes = postcard::to_stdvec(&suite)
             .map_err(|e| MlsError::SerializationError(e.to_string()))?;
         identity.extend_from_slice(&suite_bytes);
 
@@ -439,8 +438,7 @@ impl KeyPackage {
         let mut data = Vec::new();
         data.extend_from_slice(&self.version.to_be_bytes());
 
-        let suite_bytes = bincode::DefaultOptions::new()
-            .serialize(&self.cipher_suite)
+        let suite_bytes = postcard::to_stdvec(&self.cipher_suite)
             .map_err(|e| MlsError::SerializationError(e.to_string()))?;
         data.extend_from_slice(&suite_bytes);
 
@@ -449,8 +447,7 @@ impl KeyPackage {
         data.extend_from_slice(&self.agreement_key);
 
         // Include credential
-        let cred_bytes = bincode::DefaultOptions::new()
-            .serialize(&self.credential)
+        let cred_bytes = postcard::to_stdvec(&self.credential)
             .map_err(|e| MlsError::SerializationError(e.to_string()))?;
         data.extend_from_slice(&cred_bytes);
 
@@ -865,10 +862,8 @@ mod tests {
     #[test]
     fn test_extension_serialization() {
         let ext = Extension::ApplicationId(vec![1, 2, 3]);
-        let serialized = bincode::DefaultOptions::new().serialize(&ext).unwrap();
-        let deserialized: Extension = bincode::DefaultOptions::new()
-            .deserialize(&serialized)
-            .unwrap();
+        let serialized = postcard::to_stdvec(&ext).unwrap();
+        let deserialized: Extension = postcard::from_bytes(&serialized).unwrap();
 
         match deserialized {
             Extension::ApplicationId(data) => assert_eq!(data, vec![1, 2, 3]),

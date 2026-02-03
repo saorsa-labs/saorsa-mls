@@ -5,7 +5,7 @@ use crate::{
     member::*,
     EpochNumber, MessageSequence, MlsError, Result,
 };
-use bincode::Options;
+// postcard serialization (bincode removed)
 use saorsa_pqc::api::{
     MlDsa, MlDsaPublicKey, MlDsaSecretKey, MlKem, MlKemCiphertext, MlKemSecretKey,
 };
@@ -462,16 +462,12 @@ impl ProtocolSessionState {
 impl MlsMessage {
     /// Serialize message to bytes
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        bincode::DefaultOptions::new()
-            .serialize(self)
-            .map_err(|e| MlsError::SerializationError(e.to_string()))
+        postcard::to_stdvec(self).map_err(|e| MlsError::SerializationError(e.to_string()))
     }
 
     /// Deserialize message from bytes
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        bincode::DefaultOptions::new()
-            .deserialize(data)
-            .map_err(|e| MlsError::DeserializationError(e.to_string()))
+        postcard::from_bytes(data).map_err(|e| MlsError::DeserializationError(e.to_string()))
     }
 }
 
@@ -840,8 +836,8 @@ mod tests {
             signer: MemberId::generate(),
         };
 
-        let bytes = bincode::DefaultOptions::new().serialize(&info).unwrap();
-        let decoded: GroupInfo = bincode::DefaultOptions::new().deserialize(&bytes).unwrap();
+        let bytes = postcard::to_stdvec(&info).unwrap();
+        let decoded: GroupInfo = postcard::from_bytes(&bytes).unwrap();
 
         assert_eq!(info.group_id, decoded.group_id);
         assert_eq!(info.epoch, decoded.epoch);

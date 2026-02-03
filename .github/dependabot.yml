@@ -53,7 +53,7 @@ updates:
       serde-ecosystem:
         patterns:
           - "serde*"
-          - "bincode"
+          - "postcard"
         update-types:
           - "minor"
           - "patch"

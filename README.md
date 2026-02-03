@@ -88,7 +88,7 @@ async fn main() -> anyhow::Result<()> {
 
 - The only available ciphersuite today is `CipherSuite::Ed25519ChaCha20Poly1305Blake3`.
 - Epoch changes can be triggered with `group.update_epoch().await?;`.
-- The wire format uses `bincode` serialization and is not stable across versions.
+- The wire format uses `postcard` serialization and is not stable across versions.
 
 ## Protocol Details (RFC 9420 with PQC)
 
@@ -129,7 +129,7 @@ This crate is not yet production-ready. Important limitations include:
 - Signatures and credential handling are simplified in places; some signatures are placeholders in tests/examples.
 - Nonce uniqueness previously relied on randomness; now derived from (epoch, sequence) but still lacks full MLS transcript binding.
 - Secrets are now zeroized where feasible, but not all paths are audited.
-- Serialization uses `bincode` with size limits; no versioning yet.
+- Serialization uses `postcard`; no versioning yet.
 
 Until these are addressed, treat this crate as a prototype for experimentation only.
 

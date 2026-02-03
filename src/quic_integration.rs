@@ -83,7 +83,7 @@ impl QuicStreamManager {
             .ok_or_else(|| anyhow::anyhow!("No connection for group"))?;
 
         // Placeholder: In real implementation, would send via QUIC stream
-        let _data = bincode::serialize(frame)?;
+        let _data = postcard::to_stdvec(frame)?;
 
         // Record stream ID
         let mut stream_ids = self.stream_ids.write();
@@ -151,12 +151,12 @@ impl QuicStreamManager {
 
 /// Helper to encode MLS frames for QUIC transport
 pub fn encode_frame(frame: &MlsFrame) -> Result<Vec<u8>> {
-    Ok(bincode::serialize(frame)?)
+    Ok(postcard::to_stdvec(frame)?)
 }
 
 /// Helper to decode MLS frames from QUIC transport
 pub fn decode_frame(data: &[u8]) -> Result<MlsFrame> {
-    Ok(bincode::deserialize(data)?)
+    Ok(postcard::from_bytes(data)?)
 }
 
 #[cfg(test)]

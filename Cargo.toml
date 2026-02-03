@@ -1,6 +1,6 @@
 [package]
 name = "saorsa-mls"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 rust-version = "1.82.0"
 authors = ["Saorsa Labs Limited <saorsalabs@gmail.com>"]
@@ -20,7 +20,7 @@ thiserror = "1.0"
 bytes = { version = "1.5", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-bincode = "1.3"
+postcard = { version = "1.1", features = ["use-std"] }
 
 # Post-Quantum Cryptography (single source of truth for all crypto operations)
 saorsa-pqc = "0.3.14"

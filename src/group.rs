@@ -12,7 +12,7 @@ use crate::{
     },
     EpochNumber, MlsError, MlsStats, Result,
 };
-use bincode::Options;
+// postcard serialization (size limits removed - postcard doesn't support them)
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use saorsa_pqc::api::{MlDsa, MlDsaPublicKey, MlKem};
@@ -232,11 +232,8 @@ impl MlsGroup {
 
         // Create welcome message (no locks held)
         let group_info = self.create_group_info()?;
-        let group_info_bytes = {
-            let opts = bincode::DefaultOptions::new().with_limit(1_048_576);
-            opts.serialize(&group_info)
-                .map_err(|e| MlsError::SerializationError(e.to_string()))?
-        };
+        let group_info_bytes = postcard::to_stdvec(&group_info)
+            .map_err(|e| MlsError::SerializationError(e.to_string()))?;
 
         // Sign group info with creator's key (supports both ML-DSA and SLH-DSA)
         let signature_enum = self.creator.sign(&group_info_bytes)?;
@@ -1117,9 +1114,9 @@ mod tests {
     #[test]
     fn test_group_id_serialization() {
         let id = GroupId::generate();
-        let serialized = bincode::serialize(&id).expect("serialization failed");
+        let serialized = postcard::to_stdvec(&id).expect("serialization failed");
         let deserialized: GroupId =
-            bincode::deserialize(&serialized).expect("deserialization failed");
+            postcard::from_bytes(&serialized).expect("deserialization failed");
         assert_eq!(id, deserialized);
     }
 
