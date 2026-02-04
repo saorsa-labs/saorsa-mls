@@ -1,6 +1,6 @@
 [package]
 name = "saorsa-mls"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2021"
 rust-version = "1.82.0"
 authors = ["Saorsa Labs Limited <saorsalabs@gmail.com>"]
