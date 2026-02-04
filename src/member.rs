@@ -264,8 +264,8 @@ impl Credential {
         }
 
         // Add cipher suite information
-        let suite_bytes = postcard::to_stdvec(&suite)
-            .map_err(|e| MlsError::SerializationError(e.to_string()))?;
+        let suite_bytes =
+            postcard::to_stdvec(&suite).map_err(|e| MlsError::SerializationError(e.to_string()))?;
         identity.extend_from_slice(&suite_bytes);
 
         // SECURITY FIX: Include public key in signed data to bind credential to specific keypair
