@@ -78,6 +78,9 @@ jobs:
     name: Dependency Review
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: write
     steps:
     - name: Checkout code
       uses: actions/checkout@v6
@@ -86,11 +89,7 @@ jobs:
       uses: actions/dependency-review-action@v4
       with:
         fail-on-severity: moderate
-        allow-ghsas: |
-          # Add any specific advisories you want to allow (with justification)
-        deny-licenses: |
-          GPL-2.0, GPL-3.0
-          # Customize based on your license policy
+        deny-licenses: GPL-2.0-only, GPL-2.0-or-later, GPL-3.0-only, GPL-3.0-or-later
 
   semgrep:
     name: Semgrep Security Scan
