@@ -24,7 +24,7 @@ jobs:
       uses: dtolnay/rust-toolchain@stable
 
     - name: Cache cargo registry
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: |
           ~/.cargo/registry
@@ -32,7 +32,7 @@ jobs:
         key: bench-cargo-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Cache target directory
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: target
         key: bench-target-${{ hashFiles('**/Cargo.lock') }}
@@ -132,7 +132,7 @@ jobs:
       run: cargo install cargo-valgrind
 
     - name: Cache cargo registry
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: |
           ~/.cargo/registry
@@ -190,7 +190,7 @@ jobs:
       uses: taiki-e/install-action@hyperfine
 
     - name: Cache cargo registry
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: |
           ~/.cargo/registry
@@ -272,7 +272,7 @@ jobs:
         tool: cargo-bloat
 
     - name: Cache cargo registry
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: |
           ~/.cargo/registry
@@ -333,7 +333,7 @@ jobs:
     # Note: cargo-timings is not available, using built-in --timings flag instead
 
     - name: Cache cargo registry
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: |
           ~/.cargo/registry
