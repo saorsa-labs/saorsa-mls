@@ -160,6 +160,12 @@ Licensed under either of:
 
 at your option.
 
+## Specifications
+
+- **[docs/SPEC-2.md](docs/SPEC-2.md)** — Core MLS implementation specification (TreeKEM, Welcome, epoch advancement, wire format, security properties)
+- **[docs/SPEC-PROD.md](docs/SPEC-PROD.md)** — Production readiness checklist and gap analysis
+- **[docs/adr/ADR-001](docs/adr/ADR-001-post-quantum-mls.md)** — Decision to use post-quantum cryptography exclusively (no classical fallback)
+
 ## Security
 
 For security issues, please contact: saorsalabs@gmail.com
