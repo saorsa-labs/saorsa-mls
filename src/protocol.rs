@@ -565,11 +565,10 @@ impl GroupId {
         Self(id)
     }
 
-    /// Generate a random group ID
+    /// Generate a random group ID using the OS CSPRNG.
     pub fn generate() -> Self {
-        use rand_core::{OsRng, RngCore};
         let mut id = vec![0u8; 32];
-        OsRng.fill_bytes(&mut id);
+        getrandom::getrandom(&mut id).unwrap_or_else(|_| std::process::abort());
         Self(id)
     }
 

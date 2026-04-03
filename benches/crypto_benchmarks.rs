@@ -1,5 +1,6 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
 use saorsa_mls::*;
+use std::hint::black_box;
 
 fn benchmark_key_generation(c: &mut Criterion) {
     c.bench_function("key_generation", |b| {
