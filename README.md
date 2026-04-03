@@ -153,12 +153,12 @@ Contributions are welcome! Please read our contributing guidelines and submit pu
 
 ## License
 
-This project is dual-licensed under:
-- GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later)
-- Commercial License
+Licensed under either of:
 
-For AGPL-3.0 license details, see [LICENSE-AGPL-3.0](LICENSE-AGPL-3.0).
-For commercial licensing, contact: saorsalabs@gmail.com
+- [Apache License, Version 2.0](LICENSE-APACHE)
+- [MIT License](LICENSE-MIT)
+
+at your option.
 
 ## Security
 
