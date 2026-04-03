@@ -932,12 +932,17 @@ impl AeadCipher {
     }
 }
 
-/// Generate random bytes using the same RNG as saorsa-pqc
+/// Generate cryptographically secure random bytes via the OS CSPRNG.
+///
+/// # Panics
+///
+/// Aborts the process if the OS random number generator is unavailable.
+/// This is an unrecoverable security invariant — cryptographic operations
+/// cannot proceed safely without a functioning CSPRNG.
 #[must_use]
 pub fn random_bytes(len: usize) -> Vec<u8> {
-    use rand_core::{OsRng, RngCore};
     let mut bytes = vec![0u8; len];
-    OsRng.fill_bytes(&mut bytes);
+    getrandom::getrandom(&mut bytes).unwrap_or_else(|_| std::process::abort());
     bytes
 }
 
