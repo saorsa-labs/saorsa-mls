@@ -25,7 +25,7 @@ jobs:
         include:
           # Test with minimum supported Rust version
           - os: ubuntu-latest
-            rust: 1.86.0  # MSRV based on dependency requirements (criterion 0.8)
+            rust: 1.88.0  # MSRV based on dependency requirements (time 0.3.47)
         exclude:
           # Reduce matrix size for efficiency while maintaining coverage
           - os: windows-latest
