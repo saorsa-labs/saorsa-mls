@@ -942,7 +942,7 @@ impl AeadCipher {
 #[must_use]
 pub fn random_bytes(len: usize) -> Vec<u8> {
     let mut bytes = vec![0u8; len];
-    getrandom::getrandom(&mut bytes).unwrap_or_else(|_| std::process::abort());
+    getrandom::fill(&mut bytes).unwrap_or_else(|_| std::process::abort());
     bytes
 }
 
