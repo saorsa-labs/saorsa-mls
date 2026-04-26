@@ -29,7 +29,7 @@ saorsa-pqc = "0.5"
 chacha20poly1305 = "0.10"
 
 # Random number generation (OS-provided CSPRNG)
-getrandom = "0.2"
+getrandom = "0.4"
 
 # Constant-time operations (also used by saorsa-pqc)
 subtle = "2.5"
