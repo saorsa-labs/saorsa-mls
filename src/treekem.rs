@@ -90,9 +90,13 @@ pub mod treemath {
     }
 
     /// Node index of leaf number `leaf`.
+    ///
+    /// Uses saturating multiplication so a hostile/oversized `leaf` can never
+    /// wrap and alias a valid node index; an out-of-range leaf maps to an
+    /// out-of-range (or odd) node index that downstream lookups treat as blank.
     #[must_use]
     pub fn leaf_to_node(leaf: u32) -> u32 {
-        leaf * 2
+        leaf.saturating_mul(2)
     }
 
     /// Leaf number of leaf node `x`.
@@ -521,8 +525,14 @@ impl RatchetTree {
     }
 
     /// Borrow the leaf node for `leaf`, if present and non-blank.
+    ///
+    /// Returns `None` for any out-of-range `leaf` (including hostile values)
+    /// before any index arithmetic.
     #[must_use]
     pub fn leaf(&self, leaf: u32) -> Option<&LeafNodeData> {
+        if leaf >= self.leaf_capacity() {
+            return None;
+        }
         match self.node(treemath::leaf_to_node(leaf)) {
             Some(Node::Leaf(data)) => Some(data),
             _ => None,

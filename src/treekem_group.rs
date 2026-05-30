@@ -1395,6 +1395,27 @@ mod tests {
     }
 
     #[test]
+    fn test_hostile_sender_leaf_does_not_panic() {
+        // A message claiming sender_leaf = u32::MAX must be rejected cleanly,
+        // not panic/wrap (review: unchecked leaf * 2).
+        let (mut alice_group, mut bob_group, _bob) = two_member_group();
+        let mut msg = alice_group.encrypt_message(b"x").unwrap();
+        msg.sender_leaf = u32::MAX;
+        assert!(bob_group.decrypt_message(&msg).is_err());
+    }
+
+    #[test]
+    fn test_remove_member_hostile_index_does_not_panic() {
+        let (mut alice_group, _bob_group, _bob) = two_member_group();
+        assert!(alice_group.remove_member(u32::MAX).is_err());
+        assert_eq!(
+            alice_group.epoch(),
+            1,
+            "failed remove must not advance epoch"
+        );
+    }
+
+    #[test]
     fn test_commit_path_leaf_must_match_committer() {
         // A commit signed as one member but whose UpdatePath rotates a different
         // leaf must be rejected (review finding #1).
