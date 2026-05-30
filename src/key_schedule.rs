@@ -40,7 +40,7 @@
 //! `psk_secret` is implicitly zero.
 
 use crate::{
-    crypto::{CipherSuite, MlsHash},
+    crypto::{CipherSuite, Hash, MlsHash},
     MlsError, Result,
 };
 use zeroize::Zeroizing;
@@ -96,22 +96,36 @@ fn extract(suite: CipherSuite, salt: &[u8], ikm: &[u8]) -> Result<Vec<u8>> {
     hmac(suite, salt, ikm)
 }
 
-/// HKDF-Expand for a single output block (`len <= Nh`, which holds for every
-/// MLS key-schedule secret): `T(1) = HMAC(prk, info ‖ 0x01)`, truncated to
-/// `len`.
+/// HKDF-Expand (RFC 5869 §2.3): `T(i) = HMAC(prk, T(i-1) ‖ info ‖ i)`,
+/// concatenated and truncated to `len` (max `255 * Nh`). Every key-schedule
+/// secret is exactly `Nh` (a single block); the exporter may request more. All
+/// intermediate buffers are zeroized.
 fn expand(suite: CipherSuite, prk: &[u8], info: &[u8], len: usize) -> Result<Vec<u8>> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
     let nh = KdfFamily::for_suite(suite).nh();
-    if len > nh {
+    let n_blocks = len.div_ceil(nh);
+    if n_blocks > 255 {
         return Err(MlsError::CryptoError(format!(
-            "expand length {len} exceeds Nh {nh}"
+            "expand length {len} exceeds 255*Nh"
         )));
     }
-    let mut data = Vec::with_capacity(info.len() + 1);
-    data.extend_from_slice(info);
-    data.push(0x01);
-    let mut block = hmac(suite, prk, &data)?;
-    block.truncate(len);
-    Ok(block)
+    // okm is held in a Zeroizing buffer of the full block-aligned size and is
+    // never truncated, so its entire backing (including the discarded tail
+    // beyond `len`) is wiped on drop.
+    let mut okm: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(n_blocks * nh));
+    let mut prev: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::new());
+    for i in 1..=n_blocks {
+        let mut data: Zeroizing<Vec<u8>> =
+            Zeroizing::new(Vec::with_capacity(prev.len() + info.len() + 1));
+        data.extend_from_slice(&prev);
+        data.extend_from_slice(info);
+        data.push(i as u8);
+        prev = Zeroizing::new(hmac(suite, prk, &data)?);
+        okm.extend_from_slice(&prev);
+    }
+    Ok(okm[..len].to_vec())
 }
 
 /// RFC 9420 `ExpandWithLabel(secret, label, context, length)`.
@@ -300,14 +314,16 @@ impl EpochSecrets {
     }
 
     /// MLS exporter (RFC 9420 §8.5):
-    /// `DeriveSecret(exporter_secret, label)` mixed with a context hash.
+    /// `ExpandWithLabel(DeriveSecret(exporter_secret, label), "exported", Hash(context), length)`.
+    /// `length` may be up to `255 * Nh`.
     ///
     /// # Errors
     ///
-    /// Returns [`MlsError`] on HKDF failure.
+    /// Returns [`MlsError`] on HKDF failure or if `length` exceeds `255 * Nh`.
     pub fn export(&self, label: &str, context: &[u8], length: usize) -> Result<Vec<u8>> {
         let derived = derive_secret(self.suite, &self.exporter_secret, label)?;
-        expand_with_label(self.suite, &derived, "exported", context, length)
+        let context_hash = Hash::new(self.suite).hash(context);
+        expand_with_label(self.suite, &derived, "exported", &context_hash, length)
     }
 }
 
@@ -425,10 +441,34 @@ mod tests {
     }
 
     #[test]
-    fn test_expand_with_label_rejects_overlong_output() {
-        // requesting more than Nh bytes from a single-block expand must error
-        assert!(expand_with_label(suite_256(), &[0u8; 32], "x", b"", 33).is_err());
-        assert!(expand_with_label(suite_512(), &[0u8; 64], "x", b"", 65).is_err());
+    fn test_expand_multi_block_lengths() {
+        // multi-block HKDF-Expand produces exact lengths beyond a single block,
+        // and rejects > 255*Nh.
+        let out = expand_with_label(suite_256(), &[0u8; 32], "x", b"", 100).unwrap();
+        assert_eq!(out.len(), 100); // > Nh=32 → 4 blocks
+        let out512 = expand_with_label(suite_512(), &[0u8; 64], "x", b"", 200).unwrap();
+        assert_eq!(out512.len(), 200);
+        // raw expand (fixed info) is prefix-stable across lengths per RFC 5869
+        let long = expand(suite_256(), &[1u8; 32], b"info", 100).unwrap();
+        let short = expand(suite_256(), &[1u8; 32], b"info", 32).unwrap();
+        assert_eq!(&long[..32], &short[..], "HKDF-Expand must be prefix-stable");
+        // 255*Nh+1 must error
+        assert!(expand_with_label(suite_256(), &[0u8; 32], "x", b"", 255 * 32 + 1).is_err());
+    }
+
+    #[test]
+    fn test_sha512_family_determinism() {
+        // the HMAC-SHA3-512 path must also be deterministic across the full
+        // secret set (MiniMax review: 512 family only had a size test).
+        let a = EpochSecrets::derive(suite_512(), &[7u8; 64], &[9u8; 64], b"ctx").unwrap();
+        let b = EpochSecrets::derive(suite_512(), &[7u8; 64], &[9u8; 64], b"ctx").unwrap();
+        assert_eq!(a.encryption_secret(), b.encryption_secret());
+        assert_eq!(a.init_secret(), b.init_secret());
+        assert_eq!(a.epoch_authenticator(), b.epoch_authenticator());
+        assert_eq!(
+            a.export("x", b"ctx", 100).unwrap(),
+            b.export("x", b"ctx", 100).unwrap()
+        );
     }
 
     /// End-to-end P3→P4: a real UpdatePath commit_secret, fed through the key
