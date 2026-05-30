@@ -668,6 +668,68 @@ impl RatchetTree {
         (0..self.leaf_capacity()).find(|&leaf| self.node(treemath::leaf_to_node(leaf)).is_none())
     }
 
+    /// Recompute RFC 9420 §7.9 parent hashes along `leaf`'s direct path after
+    /// its node keys have been (re)installed by an UpdatePath.
+    ///
+    /// Each path node's `parent_hash` binds it to (a) its parent's encryption
+    /// key, (b) its parent's own parent hash, and (c) the tree hash of its
+    /// sibling subtree — the standard chain that prevents tree-grafting /
+    /// node-relocation attacks. The root's parent hash is empty. The values are
+    /// a deterministic function of public state, so committer and members agree
+    /// and the result is folded into [`Self::tree_hash`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MlsError`] on internal tree-math/serialization failure.
+    pub fn set_parent_hashes(&mut self, leaf: u32) -> Result<()> {
+        let width = self.width();
+        let leaf_node = treemath::leaf_to_node(leaf);
+        let direct = treemath::direct_path(leaf_node, width)?;
+        let copath = treemath::copath(leaf_node, width)?;
+        let Some(&root_idx) = direct.last() else {
+            return Ok(()); // single-leaf tree: no parent nodes
+        };
+        if let Some(Node::Parent(p)) = self.nodes[root_idx as usize].as_mut() {
+            p.parent_hash = Vec::new(); // root has no parent
+        }
+        // Walk from just-below-root down to the leaf's parent, so each node's
+        // parent (one step closer to the root) already has its parent hash set.
+        for i in (0..direct.len().saturating_sub(1)).rev() {
+            let parent_idx = direct[i + 1];
+            let sibling_idx = copath[i + 1];
+            let (parent_enc, parent_ph) = match self.node(parent_idx) {
+                Some(Node::Parent(p)) => (p.encryption_key.clone(), p.parent_hash.clone()),
+                _ => {
+                    return Err(MlsError::TreeKemError(format!(
+                        "parent-hash: node {parent_idx} is not a populated parent"
+                    )))
+                }
+            };
+            let sibling_hash = self.tree_hash_node(sibling_idx)?;
+            let parent_hash = self.parent_hash_input(&parent_enc, &parent_ph, &sibling_hash);
+            if let Some(Node::Parent(p)) = self.nodes[direct[i] as usize].as_mut() {
+                p.parent_hash = parent_hash;
+            }
+        }
+        Ok(())
+    }
+
+    /// `Hash(ParentHashInput{ encryption_key, parent_hash, original_sibling_tree_hash })`
+    /// (RFC 9420 §7.9), length-prefixed for unambiguous encoding.
+    fn parent_hash_input(
+        &self,
+        encryption_key: &[u8],
+        parent_hash: &[u8],
+        sibling_tree_hash: &[u8],
+    ) -> Vec<u8> {
+        let hasher = Hash::new(self.suite);
+        let mut input = Vec::new();
+        push_len_prefixed(&mut input, encryption_key);
+        push_len_prefixed(&mut input, parent_hash);
+        push_len_prefixed(&mut input, sibling_tree_hash);
+        hasher.hash(&input)
+    }
+
     /// Grow the backing array so the perfect tree can hold `leaf_index`.
     fn grow_to_fit(&mut self, leaf_index: u32) {
         let required = treemath::width_for_leaves(leaf_index + 1) as usize;
@@ -846,6 +908,8 @@ impl RatchetTree {
             }));
             self.path_secrets.insert(dn, ps);
         }
+        // Bind the rotated path with RFC 9420 parent hashes (folded into tree_hash).
+        self.set_parent_hashes(leaf)?;
 
         Ok((
             UpdatePath {
@@ -986,6 +1050,9 @@ impl RatchetTree {
         for (dn, ps) in derived {
             self.path_secrets.insert(dn, ps);
         }
+        // Recompute parent hashes the same way the committer did; they feed
+        // tree_hash, so any divergence is fail-closed at the key schedule.
+        self.set_parent_hashes(update_path.leaf_index)?;
         Ok(commit_secret)
     }
 }
@@ -1629,6 +1696,67 @@ mod tests {
             tree.add_leaf(id.key_package.clone()).unwrap();
         }
         (tree, ids)
+    }
+
+    #[test]
+    fn test_parent_hashes_set_on_update() {
+        // After a commit, the committer's direct-path parent nodes carry a
+        // non-empty parent hash (root excepted), per RFC 9420 §7.9.
+        let (mut tree, _ids) = build_group(4); // width 7, depth 2; owner = leaf 0
+        tree.generate_update_path(CTX, None).unwrap();
+        // direct_path(0, 7) = [1, 3]; node 3 is the root.
+        match tree.node(1) {
+            Some(Node::Parent(p)) => assert!(
+                !p.parent_hash.is_empty(),
+                "non-root path node must have a parent hash"
+            ),
+            other => panic!("expected populated parent at node 1, got {other:?}"),
+        }
+        match tree.node(3) {
+            Some(Node::Parent(p)) => {
+                assert!(p.parent_hash.is_empty(), "root parent hash must be empty")
+            }
+            other => panic!("expected root parent at node 3, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parent_hash_binds_sibling_subtree() {
+        // Two trees identical except for one leaf in the committer's copath
+        // subtree must yield different parent hashes for the same seeded update,
+        // proving the sibling subtree is bound into the parent hash.
+        let suite = CipherSuite::default();
+        let a = MemberIdentity::generate(MemberId::generate()).unwrap();
+        let b = MemberIdentity::generate(MemberId::generate()).unwrap();
+        let c1 = MemberIdentity::generate(MemberId::generate()).unwrap();
+        let c2 = MemberIdentity::generate(MemberId::generate()).unwrap();
+
+        let build = |third: &MemberIdentity| {
+            let mut t = RatchetTree::new(a.key_package.clone(), suite).unwrap();
+            t.attach_owner(0, a.kem_secret().unwrap().clone()).unwrap();
+            t.add_leaf(b.key_package.clone()).unwrap(); // leaf 1 (copath of leaf 0 at node 2)
+            t.add_leaf(third.key_package.clone()).unwrap(); // leaf 2 (right subtree)
+            t
+        };
+        let mut t1 = build(&c1);
+        let mut t2 = build(&c2);
+        let seed = [5u8; 32];
+        t1.generate_update_path(CTX, Some(&seed)).unwrap();
+        t2.generate_update_path(CTX, Some(&seed)).unwrap();
+        // node 1 is the committer's path node whose sibling subtree (node 5)
+        // contains the differing leaf 2.
+        let ph1 = match t1.node(1) {
+            Some(Node::Parent(p)) => p.parent_hash.clone(),
+            _ => panic!(),
+        };
+        let ph2 = match t2.node(1) {
+            Some(Node::Parent(p)) => p.parent_hash.clone(),
+            _ => panic!(),
+        };
+        assert_ne!(
+            ph1, ph2,
+            "parent hash must change when the sibling subtree changes"
+        );
     }
 
     #[test]

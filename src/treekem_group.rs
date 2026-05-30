@@ -32,13 +32,14 @@
 //! (ADR-002 P5/P6). It deliberately uses the post-quantum primitives only.
 //!
 //! Commits and Welcomes are authenticated by the committer's signature, and
-//! application messages by the sender's signature. **Tracked follow-up:** full
-//! RFC 9420 §7.9 parent-hash verification — tree integrity is currently bound by
-//! the committer's signature over the complete UpdatePath (which determines the
-//! resulting tree), and `process_update_path` independently verifies each
-//! derived node public key; explicit parent-hash chaining is a defence-in-depth
-//! refinement. PSK injection, external commits, and reinit remain out of scope
-//! per ADR-002.
+//! application messages by the sender's signature. Tree integrity is bound
+//! three ways: RFC 9420 §7.9 parent hashes are computed along the committer's
+//! direct path and folded into the tree hash
+//! ([`crate::treekem::RatchetTree::set_parent_hashes`]); the committer signs the
+//! resulting tree hash in each commit (receivers recompute and must match it);
+//! and `process_update_path` independently verifies every derived node public
+//! key. PSK injection, external commits, and reinit remain out of scope per
+//! ADR-002.
 
 use crate::{
     crypto::{AeadCipher, CipherSuite, Signature},
@@ -112,6 +113,10 @@ pub struct TreeKemCommit {
     pub removed_leaves: Vec<u32>,
     /// The UpdatePath rotating the committer's direct path.
     pub update_path: UpdatePath,
+    /// Tree hash of the committer's tree after applying this commit (including
+    /// parent hashes). Receivers recompute and must match it, binding the
+    /// committer's signature to the exact resulting tree.
+    pub tree_hash_after: Vec<u8>,
     /// Committer's signature over the commit contents (see `commit_tbs`).
     pub signature: Vec<u8>,
 }
@@ -238,6 +243,9 @@ impl TreeKemGroup {
 
         let new_epoch = self.epoch + 1;
         let added = vec![(new_leaf, new_member.clone())];
+        // Tree hash after the rotation (includes parent hashes) — bound into
+        // both the commit signature and the key-schedule group context.
+        let new_tree_hash = self.tree.tree_hash()?;
 
         // Commit for existing members (they add the leaf, then process the path).
         let commit_tbs = Self::commit_tbs(
@@ -247,6 +255,7 @@ impl TreeKemGroup {
             &added,
             &[],
             &update_path,
+            &new_tree_hash,
         )?;
         let commit_signature = self.identity.sign(&commit_tbs)?.to_bytes();
         let commit = TreeKemCommit {
@@ -255,11 +264,11 @@ impl TreeKemGroup {
             added,
             removed_leaves: Vec::new(),
             update_path,
+            tree_hash_after: new_tree_hash.clone(),
             signature: commit_signature,
         };
 
         // Welcome for the new member (reconstructs the epoch from joiner_secret).
-        let new_tree_hash = self.tree.tree_hash()?;
         let new_ctx = Self::group_context(&self.group_id, new_epoch, &new_tree_hash);
         let joiner = EpochSecrets::joiner_secret(
             self.suite,
@@ -419,6 +428,7 @@ impl TreeKemGroup {
         let (update_path, commit_secret) = self.tree.generate_update_path(&path_aad, None)?;
 
         let new_epoch = self.epoch + 1;
+        let new_tree_hash = self.tree.tree_hash()?;
         let tbs = Self::commit_tbs(
             &self.group_id,
             new_epoch,
@@ -426,10 +436,11 @@ impl TreeKemGroup {
             &[],
             &removed_leaves,
             &update_path,
+            &new_tree_hash,
         )?;
         let signature = self.identity.sign(&tbs)?.to_bytes();
 
-        let new_ctx = Self::group_context(&self.group_id, new_epoch, &self.tree.tree_hash()?);
+        let new_ctx = Self::group_context(&self.group_id, new_epoch, &new_tree_hash);
         self.epoch_secrets = self.epoch_secrets.next(&commit_secret, &new_ctx)?;
         self.epoch = new_epoch;
         self.send_generation = 0;
@@ -439,6 +450,7 @@ impl TreeKemGroup {
             added: Vec::new(),
             removed_leaves,
             update_path,
+            tree_hash_after: new_tree_hash,
             signature,
         })
     }
@@ -480,6 +492,7 @@ impl TreeKemGroup {
             &commit.added,
             &commit.removed_leaves,
             &commit.update_path,
+            &commit.tree_hash_after,
         )?;
         let sig = Self::reconstruct_signature_for(self.suite, &commit.signature)?;
         {
@@ -526,7 +539,15 @@ impl TreeKemGroup {
         }
         let path_aad = Self::path_context(&self.group_id, self.epoch);
         let commit_secret = tree.process_update_path(&commit.update_path, &path_aad)?;
-        let new_ctx = Self::group_context(&self.group_id, new_epoch, &tree.tree_hash()?);
+        // Explicit tree-integrity check: our recomputed tree hash (incl. parent
+        // hashes) must equal the committer-signed value.
+        let new_tree_hash = tree.tree_hash()?;
+        if new_tree_hash != commit.tree_hash_after {
+            return Err(MlsError::InvalidMessage(
+                "commit tree hash does not match committer signature".into(),
+            ));
+        }
+        let new_ctx = Self::group_context(&self.group_id, new_epoch, &new_tree_hash);
         let new_epoch_secrets = self.epoch_secrets.next(&commit_secret, &new_ctx)?;
 
         // All checks passed — commit the new state atomically.
@@ -755,6 +776,7 @@ impl TreeKemGroup {
     /// Bytes signed by the committer for a [`TreeKemCommit`]: a domain-separated,
     /// length-prefixed encoding of group id, new epoch, committer leaf, removed
     /// leaves, and the full UpdatePath (which determines the resulting tree).
+    #[allow(clippy::too_many_arguments)]
     fn commit_tbs(
         group_id: &[u8],
         new_epoch: EpochNumber,
@@ -762,6 +784,7 @@ impl TreeKemGroup {
         added: &[(u32, KeyPackage)],
         removed_leaves: &[u32],
         update_path: &UpdatePath,
+        tree_hash_after: &[u8],
     ) -> Result<Vec<u8>> {
         let mut tbs = Vec::new();
         tbs.extend_from_slice(b"saorsa-mls TreeKemCommit v1");
@@ -779,6 +802,7 @@ impl TreeKemGroup {
         let path_bytes = postcard::to_stdvec(update_path)
             .map_err(|e| MlsError::SerializationError(e.to_string()))?;
         push_field(&mut tbs, &path_bytes)?;
+        push_field(&mut tbs, tree_hash_after)?;
         Ok(tbs)
     }
 
@@ -1262,6 +1286,21 @@ mod tests {
         let (_c, mut welcome) = alice_group.add_member(&bob.key_package).unwrap();
         welcome.encrypted_joiner.aead_ct[0] ^= 0xFF;
         assert!(TreeKemGroup::from_welcome(&welcome, bob).is_err());
+    }
+
+    #[test]
+    fn test_tampered_commit_tree_hash_rejected() {
+        // tree_hash_after is in the committer-signed TBS; tampering it must fail
+        // the signature (and would also fail the explicit tree-hash check).
+        let (mut alice_group, mut bob_group, _bob) = two_member_group();
+        let mut commit = alice_group.update().unwrap();
+        commit.tree_hash_after[0] ^= 0xFF;
+        assert!(bob_group.process_commit(&commit).is_err());
+        assert_eq!(
+            bob_group.epoch(),
+            1,
+            "rejected commit must not advance epoch"
+        );
     }
 
     #[test]
