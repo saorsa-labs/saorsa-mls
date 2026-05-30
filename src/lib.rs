@@ -53,6 +53,7 @@ use thiserror::Error;
 pub mod api;
 pub mod crypto;
 pub mod group;
+pub mod key_schedule;
 pub mod member;
 pub mod protocol;
 pub mod quic_integration;
