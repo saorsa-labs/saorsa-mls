@@ -212,9 +212,9 @@ impl MlsGroup {
         )
         .map_err(|e| MlsError::CryptoError(format!("Invalid KEM public key: {e:?}")))?;
 
-        if should_advance {
-            self.advance_epoch()?;
-        }
+        // NOTE: a single `advance_epoch()` above already bumped the epoch for this
+        // add. A second bump here was an unintended double epoch increment
+        // (see ADR-002 follow-up #2); removed so an add advances the epoch by 1.
 
         let application_secret_bytes = self
             .secrets
@@ -1237,6 +1237,28 @@ mod tests {
 
         // Member should be added
         assert_eq!(group.member_ids().len(), initial_size + 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_add_member_advances_epoch_by_one() -> crate::Result<()> {
+        // Regression for ADR-002 follow-up #2: add_member used to call
+        // advance_epoch() twice, double-bumping the epoch on every add.
+        let config = GroupConfig::default();
+        let creator_identity = MemberIdentity::generate(MemberId::generate())?;
+
+        let mut group = MlsGroup::new(config, creator_identity).await?;
+        let epoch_before = group.current_epoch();
+
+        let new_member = MemberIdentity::generate(MemberId::generate())?;
+        let _welcome = group.add_member(&new_member).await?;
+
+        assert_eq!(
+            group.current_epoch(),
+            epoch_before + 1,
+            "add_member must advance the epoch by exactly 1, not 2"
+        );
 
         Ok(())
     }

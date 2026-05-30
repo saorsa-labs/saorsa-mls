@@ -665,18 +665,18 @@ impl KeyPair {
 
     /// Generate a key pair from a seed (for FIPS KATs)
     ///
-    /// Note: Current implementation uses standard key generation.
-    /// Deterministic generation from seed requires RNG seeding support
-    /// in saorsa-pqc which is pending upstream.
-    ///
-    /// For now, this validates that key generation works with correct sizes.
+    /// Note: this helper generates a *combined* signature + KEM key pair and
+    /// currently ignores the seed (it validates that key generation works with
+    /// correct sizes). Deterministic per-algorithm keygen IS available in
+    /// `saorsa-pqc` 0.5.1 via `MlKem::generate_keypair_from_seed(d, z)` and
+    /// `MlDsa::generate_keypair_from_seed(xi)`; the TreeKEM `DeriveKeyPair`
+    /// step uses those APIs directly (see the `treekem` module) rather than
+    /// this combined helper.
     ///
     /// # Errors
     ///
     /// Returns error if seed is invalid or key generation fails.
     pub fn generate_from_seed(suite: CipherSuite, _seed: &[u8]) -> Result<Self> {
-        // TODO: Use seed when saorsa-pqc provides RNG seeding APIs
-        // For now, just generate normally to validate algorithm correctness
         Ok(Self::generate(suite))
     }
 

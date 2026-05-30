@@ -56,6 +56,7 @@ pub mod group;
 pub mod member;
 pub mod protocol;
 pub mod quic_integration;
+pub mod treekem;
 
 pub use api::{
     add_member, group_new, group_new_with_config, recv, remove_member, send, Ciphertext,
