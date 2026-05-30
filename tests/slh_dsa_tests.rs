@@ -172,7 +172,7 @@ fn test_slh_dsa_variant() {
     assert!(suite.uses_slh_dsa(), "Should use SLH-DSA");
 
     // Verify the variant is SLH-DSA-SHA2 (using fast variant)
-    let variant = suite.slh_dsa_variant();
+    let variant = suite.slh_dsa_variant().unwrap();
     // This will compile if the variant method works correctly
     assert!(format!("{:?}", variant).contains("Sha2_128f"));
 }

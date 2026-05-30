@@ -157,12 +157,16 @@ impl MemberIdentity {
         self.key_package.cipher_suite
     }
 
-    /// Get a reference to the ML-DSA signing key if available (panics for SLH-DSA)
+    /// Get a reference to the ML-DSA signing key, if this identity has one.
+    ///
+    /// Returns `None` both when no signing key is held and when the identity
+    /// uses SLH-DSA (there is no ML-DSA key in that case — use [`Self::sign`],
+    /// which handles both signature families). Never panics.
     pub fn signing_key(&self) -> Option<&MlDsaSecretKey> {
-        self.signing_key.as_deref().map(|key| match key {
-            SecretSignatureKey::MlDsa(k) => k,
-            SecretSignatureKey::SlhDsa(_) => panic!("Called signing_key() on SLH-DSA identity"),
-        })
+        match self.signing_key.as_deref() {
+            Some(SecretSignatureKey::MlDsa(k)) => Some(k),
+            _ => None,
+        }
     }
 
     /// Get a reference to the KEM secret if available
@@ -196,14 +200,14 @@ impl MemberIdentity {
 
         match signing_key.as_ref() {
             SecretSignatureKey::MlDsa(secret) => {
-                let ml_dsa = MlDsa::new(self.key_package.cipher_suite.ml_dsa_variant());
+                let ml_dsa = MlDsa::new(self.key_package.cipher_suite.ml_dsa_variant()?);
                 let signature = ml_dsa
                     .sign(secret, data)
                     .map_err(|e| MlsError::CryptoError(format!("ML-DSA signing failed: {e:?}")))?;
                 Ok(crate::crypto::Signature::MlDsa(signature))
             }
             SecretSignatureKey::SlhDsa(secret) => {
-                let slh_dsa = SlhDsa::new(self.key_package.cipher_suite.slh_dsa_variant());
+                let slh_dsa = SlhDsa::new(self.key_package.cipher_suite.slh_dsa_variant()?);
                 let signature = slh_dsa
                     .sign(secret, data)
                     .map_err(|e| MlsError::CryptoError(format!("SLH-DSA signing failed: {e:?}")))?;
@@ -392,9 +396,9 @@ impl KeyPackage {
             crate::crypto::Signature::MlDsa(sig) => {
                 use saorsa_pqc::api::{MlDsa, MlDsaPublicKey};
 
-                let ml_dsa = MlDsa::new(self.cipher_suite.ml_dsa_variant());
+                let ml_dsa = MlDsa::new(self.cipher_suite.ml_dsa_variant()?);
                 let public_key = MlDsaPublicKey::from_bytes(
-                    self.cipher_suite.ml_dsa_variant(),
+                    self.cipher_suite.ml_dsa_variant()?,
                     &self.verifying_key,
                 )
                 .map_err(|e| MlsError::CryptoError(format!("Invalid ML-DSA public key: {e:?}")))?;
@@ -406,9 +410,9 @@ impl KeyPackage {
             crate::crypto::Signature::SlhDsa(sig) => {
                 use saorsa_pqc::api::{SlhDsa, SlhDsaPublicKey};
 
-                let slh_dsa = SlhDsa::new(self.cipher_suite.slh_dsa_variant());
+                let slh_dsa = SlhDsa::new(self.cipher_suite.slh_dsa_variant()?);
                 let public_key = SlhDsaPublicKey::from_bytes(
-                    self.cipher_suite.slh_dsa_variant(),
+                    self.cipher_suite.slh_dsa_variant()?,
                     &self.verifying_key,
                 )
                 .map_err(|e| MlsError::CryptoError(format!("Invalid SLH-DSA public key: {e:?}")))?;

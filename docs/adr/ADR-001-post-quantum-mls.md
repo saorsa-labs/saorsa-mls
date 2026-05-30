@@ -4,6 +4,14 @@
 
 Accepted (2024-11)
 
+> **Amendment (2026-05-30):** this ADR's implicit forward-secrecy /
+> post-compromise-security claim is clarified by
+> [ADR-002](ADR-002-real-treekem-for-forward-secrecy-and-pcs.md). FS/PCS are
+> delivered by the real TreeKEM plane (`treekem_group::TreeKemGroup`); the
+> original `MlsGroup` is a per-epoch group-shared-secret plane without FS/PCS.
+> The decision to be post-quantum from day one is unchanged and holds for both
+> planes.
+
 ## Context
 
 The Messaging Layer Security protocol (RFC 9420) is designed with explicit algorithm agility — cipher suites are negotiated per group and can be swapped without protocol changes. Most existing MLS implementations default to classical cryptography (P-256/X25519 for key exchange, Ed25519 for signatures).

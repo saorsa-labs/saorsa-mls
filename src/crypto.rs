@@ -197,30 +197,40 @@ impl CipherSuite {
         )
     }
 
-    /// Get ML-DSA variant (panics if using SLH-DSA - check uses_slh_dsa() first)
-    #[must_use]
-    pub fn ml_dsa_variant(&self) -> MlDsaVariant {
+    /// Get the ML-DSA variant for this suite.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MlsError::CryptoError`] if the suite uses SLH-DSA signatures
+    /// (call [`Self::slh_dsa_variant`] instead, or gate on
+    /// [`Self::uses_slh_dsa`]).
+    pub fn ml_dsa_variant(&self) -> Result<MlDsaVariant> {
         match self.signature {
-            MlsSignature::MlDsa44 => MlDsaVariant::MlDsa44,
-            MlsSignature::MlDsa65 => MlDsaVariant::MlDsa65,
-            MlsSignature::MlDsa87 => MlDsaVariant::MlDsa87,
-            MlsSignature::SlhDsa128 | MlsSignature::SlhDsa192 | MlsSignature::SlhDsa256 => {
-                panic!("Called ml_dsa_variant() on SLH-DSA suite - use slh_dsa_variant() instead")
-            }
+            MlsSignature::MlDsa44 => Ok(MlDsaVariant::MlDsa44),
+            MlsSignature::MlDsa65 => Ok(MlDsaVariant::MlDsa65),
+            MlsSignature::MlDsa87 => Ok(MlDsaVariant::MlDsa87),
+            MlsSignature::SlhDsa128 | MlsSignature::SlhDsa192 | MlsSignature::SlhDsa256 => Err(
+                MlsError::CryptoError("ml_dsa_variant() called on an SLH-DSA suite".to_string()),
+            ),
         }
     }
 
-    /// Get SLH-DSA variant (panics if using ML-DSA - check uses_slh_dsa() first)
-    #[must_use]
-    pub fn slh_dsa_variant(&self) -> SlhDsaVariant {
+    /// Get the SLH-DSA variant for this suite.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MlsError::CryptoError`] if the suite uses ML-DSA signatures
+    /// (call [`Self::ml_dsa_variant`] instead, or gate on
+    /// [`Self::uses_slh_dsa`]).
+    pub fn slh_dsa_variant(&self) -> Result<SlhDsaVariant> {
         match self.signature {
             // Use "fast" variants for now as "small" variants may not be available
-            MlsSignature::SlhDsa128 => SlhDsaVariant::Sha2_128f,
-            MlsSignature::SlhDsa192 => SlhDsaVariant::Sha2_128f, // Use 128f for 192-bit security level
-            MlsSignature::SlhDsa256 => SlhDsaVariant::Sha2_256f,
-            MlsSignature::MlDsa44 | MlsSignature::MlDsa65 | MlsSignature::MlDsa87 => {
-                panic!("Called slh_dsa_variant() on ML-DSA suite - use ml_dsa_variant() instead")
-            }
+            MlsSignature::SlhDsa128 => Ok(SlhDsaVariant::Sha2_128f),
+            MlsSignature::SlhDsa192 => Ok(SlhDsaVariant::Sha2_128f), // 128f for 192-bit level
+            MlsSignature::SlhDsa256 => Ok(SlhDsaVariant::Sha2_256f),
+            MlsSignature::MlDsa44 | MlsSignature::MlDsa65 | MlsSignature::MlDsa87 => Err(
+                MlsError::CryptoError("slh_dsa_variant() called on an ML-DSA suite".to_string()),
+            ),
         }
     }
 
@@ -629,23 +639,33 @@ impl std::fmt::Debug for KeyPair {
 impl KeyPair {
     /// Generate a new key pair
     ///
-    /// # Panics
+    /// # Aborts
     ///
-    /// Panics if key generation fails (should never happen in practice).
+    /// Aborts the process if the OS CSPRNG-backed key generation fails — an
+    /// unrecoverable security invariant, mirroring [`random_bytes`]. (This
+    /// cannot happen in practice.)
     #[must_use]
     pub fn generate(suite: CipherSuite) -> Self {
         // Generate signature key pair based on suite type
         let signature_key = if suite.uses_slh_dsa() {
-            let slh_dsa = SlhDsa::new(suite.slh_dsa_variant());
+            // `uses_slh_dsa()` guarantees `slh_dsa_variant()` is Ok; abort on the
+            // impossible internal-inconsistency case (matches keygen handling).
+            let variant = suite
+                .slh_dsa_variant()
+                .unwrap_or_else(|_| std::process::abort());
+            let slh_dsa = SlhDsa::new(variant);
             let (public, secret) = slh_dsa
                 .generate_keypair()
-                .expect("SLH-DSA key generation should not fail");
+                .unwrap_or_else(|_| std::process::abort());
             SignatureKey::SlhDsa { secret, public }
         } else {
-            let ml_dsa = MlDsa::new(suite.ml_dsa_variant());
+            let variant = suite
+                .ml_dsa_variant()
+                .unwrap_or_else(|_| std::process::abort());
+            let ml_dsa = MlDsa::new(variant);
             let (public, secret) = ml_dsa
                 .generate_keypair()
-                .expect("ML-DSA key generation should not fail");
+                .unwrap_or_else(|_| std::process::abort());
             SignatureKey::MlDsa { secret, public }
         };
 
@@ -653,7 +673,7 @@ impl KeyPair {
         let ml_kem = MlKem::new(suite.ml_kem_variant());
         let (kem_public, kem_secret) = ml_kem
             .generate_keypair()
-            .expect("ML-KEM key generation should not fail");
+            .unwrap_or_else(|_| std::process::abort());
 
         Self {
             signature_key,
@@ -665,18 +685,18 @@ impl KeyPair {
 
     /// Generate a key pair from a seed (for FIPS KATs)
     ///
-    /// Note: Current implementation uses standard key generation.
-    /// Deterministic generation from seed requires RNG seeding support
-    /// in saorsa-pqc which is pending upstream.
-    ///
-    /// For now, this validates that key generation works with correct sizes.
+    /// Note: this helper generates a *combined* signature + KEM key pair and
+    /// currently ignores the seed (it validates that key generation works with
+    /// correct sizes). Deterministic per-algorithm keygen IS available in
+    /// `saorsa-pqc` 0.5.1 via `MlKem::generate_keypair_from_seed(d, z)` and
+    /// `MlDsa::generate_keypair_from_seed(xi)`; the TreeKEM `DeriveKeyPair`
+    /// step uses those APIs directly (see the `treekem` module) rather than
+    /// this combined helper.
     ///
     /// # Errors
     ///
     /// Returns error if seed is invalid or key generation fails.
     pub fn generate_from_seed(suite: CipherSuite, _seed: &[u8]) -> Result<Self> {
-        // TODO: Use seed when saorsa-pqc provides RNG seeding APIs
-        // For now, just generate normally to validate algorithm correctness
         Ok(Self::generate(suite))
     }
 
@@ -689,16 +709,18 @@ impl KeyPair {
         }
     }
 
-    /// Get ML-DSA public key (for backward compatibility, panics if using SLH-DSA)
-    #[must_use]
-    pub fn verifying_key(&self) -> &MlDsaPublicKey {
+    /// Get the ML-DSA public key. Use [`Self::verifying_key_bytes`] for the
+    /// suite-agnostic form.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MlsError::CryptoError`] if this is an SLH-DSA keypair.
+    pub fn verifying_key(&self) -> Result<&MlDsaPublicKey> {
         match &self.signature_key {
-            SignatureKey::MlDsa { public, .. } => public,
-            SignatureKey::SlhDsa { .. } => {
-                panic!(
-                    "Called verifying_key() on SLH-DSA keypair - use verifying_key_bytes() instead"
-                )
-            }
+            SignatureKey::MlDsa { public, .. } => Ok(public),
+            SignatureKey::SlhDsa { .. } => Err(MlsError::CryptoError(
+                "verifying_key() called on an SLH-DSA keypair".to_string(),
+            )),
         }
     }
 
@@ -716,14 +738,14 @@ impl KeyPair {
     pub fn sign(&self, message: &[u8]) -> Result<Signature> {
         match &self.signature_key {
             SignatureKey::MlDsa { secret, .. } => {
-                let ml_dsa = MlDsa::new(self.suite.ml_dsa_variant());
+                let ml_dsa = MlDsa::new(self.suite.ml_dsa_variant()?);
                 ml_dsa
                     .sign(secret, message)
                     .map(Signature::MlDsa)
                     .map_err(|e| MlsError::CryptoError(format!("ML-DSA signing failed: {e:?}")))
             }
             SignatureKey::SlhDsa { secret, .. } => {
-                let slh_dsa = SlhDsa::new(self.suite.slh_dsa_variant());
+                let slh_dsa = SlhDsa::new(self.suite.slh_dsa_variant()?);
                 slh_dsa
                     .sign(secret, message)
                     .map(Signature::SlhDsa)
@@ -738,11 +760,17 @@ impl KeyPair {
     pub fn verify(&self, message: &[u8], signature: &Signature) -> bool {
         match (&self.signature_key, signature) {
             (SignatureKey::MlDsa { public, .. }, Signature::MlDsa(sig)) => {
-                let ml_dsa = MlDsa::new(self.suite.ml_dsa_variant());
+                let Ok(variant) = self.suite.ml_dsa_variant() else {
+                    return false;
+                };
+                let ml_dsa = MlDsa::new(variant);
                 ml_dsa.verify(public, message, sig).unwrap_or(false)
             }
             (SignatureKey::SlhDsa { public, .. }, Signature::SlhDsa(sig)) => {
-                let slh_dsa = SlhDsa::new(self.suite.slh_dsa_variant());
+                let Ok(variant) = self.suite.slh_dsa_variant() else {
+                    return false;
+                };
+                let slh_dsa = SlhDsa::new(variant);
                 slh_dsa.verify(public, message, sig).unwrap_or(false)
             }
             // Signature type mismatch

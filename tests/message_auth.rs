@@ -15,12 +15,13 @@ async fn application_message_signature_matches_payload() {
     let plaintext = b"test message";
     let message = group.encrypt_message(plaintext).expect("encrypt");
 
-    let ml_dsa = MlDsa::new(group.cipher_suite().ml_dsa_variant());
+    let ml_dsa = MlDsa::new(group.cipher_suite().ml_dsa_variant().unwrap());
 
     // Reconstruct ML-DSA public key from bytes for low-level verification
     let pk_bytes = creator.verifying_key_bytes();
-    let public_key = MlDsaPublicKey::from_bytes(group.cipher_suite().ml_dsa_variant(), pk_bytes)
-        .expect("reconstruct public key");
+    let public_key =
+        MlDsaPublicKey::from_bytes(group.cipher_suite().ml_dsa_variant().unwrap(), pk_bytes)
+            .expect("reconstruct public key");
 
     ml_dsa
         .verify(&public_key, &message.ciphertext, &message.signature.0)
@@ -54,12 +55,13 @@ async fn welcome_message_signature_matches_payload() {
 
     let welcome = group.add_member(&new_member).await.expect("welcome");
 
-    let ml_dsa = MlDsa::new(group.cipher_suite().ml_dsa_variant());
+    let ml_dsa = MlDsa::new(group.cipher_suite().ml_dsa_variant().unwrap());
 
     // Reconstruct ML-DSA public key from bytes for low-level verification
     let pk_bytes = creator.verifying_key_bytes();
-    let public_key = MlDsaPublicKey::from_bytes(group.cipher_suite().ml_dsa_variant(), pk_bytes)
-        .expect("reconstruct public key");
+    let public_key =
+        MlDsaPublicKey::from_bytes(group.cipher_suite().ml_dsa_variant().unwrap(), pk_bytes)
+            .expect("reconstruct public key");
 
     // Signature should verify for the untampered group info
     assert!(ml_dsa

@@ -63,7 +63,15 @@ impl ReplayWindow {
 
 pub use crate::protocol::{GroupConfig, GroupId};
 
-/// MLS group state with `TreeKEM` key management - FIXED VERSION
+/// Legacy per-epoch **group shared secret (GSS)** plane.
+///
+/// NOTE: despite the historical name, this type does **not** provide TreeKEM
+/// forward secrecy or post-compromise security — every member of an epoch
+/// shares one secret (see ADR-002). It is retained for backward compatibility.
+/// For real FS/PCS use [`crate::treekem_group::TreeKemGroup`], which implements
+/// the RFC 9420 TreeKEM subset (ratchet tree + UpdatePath + key-schedule
+/// chaining + parent hashes). Migration of consumers off this type is tracked in
+/// ADR-002 (P6).
 #[derive(Debug)]
 pub struct MlsGroup {
     config: GroupConfig,
@@ -212,9 +220,9 @@ impl MlsGroup {
         )
         .map_err(|e| MlsError::CryptoError(format!("Invalid KEM public key: {e:?}")))?;
 
-        if should_advance {
-            self.advance_epoch()?;
-        }
+        // NOTE: a single `advance_epoch()` above already bumped the epoch for this
+        // add. A second bump here was an unintended double epoch increment
+        // (see ADR-002 follow-up #2); removed so an add advances the epoch by 1.
 
         let application_secret_bytes = self
             .secrets
@@ -428,12 +436,14 @@ impl MlsGroup {
                 .get_member(index)
                 .ok_or(MlsError::MemberNotFound(message.sender))?;
             MlDsaPublicKey::from_bytes(
-                self.cipher_suite.ml_dsa_variant(),
+                self.cipher_suite.ml_dsa_variant()?,
                 &member.identity.key_package.verifying_key,
             )
-            .expect("Invalid ML-DSA public key")
+            .map_err(|e| {
+                MlsError::CryptoError(format!("invalid ML-DSA public key for sender: {e:?}"))
+            })?
         };
-        let ml_dsa = MlDsa::new(self.cipher_suite.ml_dsa_variant());
+        let ml_dsa = MlDsa::new(self.cipher_suite.ml_dsa_variant()?);
         let signature_valid = ml_dsa
             .verify(&verifying_key, &message.ciphertext, &message.signature.0)
             .map_err(|e| MlsError::InvalidMessage(format!("invalid signature: {e:?}")))?;
@@ -1237,6 +1247,28 @@ mod tests {
 
         // Member should be added
         assert_eq!(group.member_ids().len(), initial_size + 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_add_member_advances_epoch_by_one() -> crate::Result<()> {
+        // Regression for ADR-002 follow-up #2: add_member used to call
+        // advance_epoch() twice, double-bumping the epoch on every add.
+        let config = GroupConfig::default();
+        let creator_identity = MemberIdentity::generate(MemberId::generate())?;
+
+        let mut group = MlsGroup::new(config, creator_identity).await?;
+        let epoch_before = group.current_epoch();
+
+        let new_member = MemberIdentity::generate(MemberId::generate())?;
+        let _welcome = group.add_member(&new_member).await?;
+
+        assert_eq!(
+            group.current_epoch(),
+            epoch_before + 1,
+            "add_member must advance the epoch by exactly 1, not 2"
+        );
 
         Ok(())
     }
