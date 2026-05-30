@@ -431,7 +431,9 @@ impl MlsGroup {
                 self.cipher_suite.ml_dsa_variant(),
                 &member.identity.key_package.verifying_key,
             )
-            .expect("Invalid ML-DSA public key")
+            .map_err(|e| {
+                MlsError::CryptoError(format!("invalid ML-DSA public key for sender: {e:?}"))
+            })?
         };
         let ml_dsa = MlDsa::new(self.cipher_suite.ml_dsa_variant());
         let signature_valid = ml_dsa

@@ -34,6 +34,14 @@ use crate::{
 use saorsa_pqc::api::{MlKem, MlKemSecretKey};
 use zeroize::Zeroize;
 
+/// Upper bound on the number of leaves (members) a ratchet tree may hold.
+///
+/// Bounding the leaf count keeps every node/leaf index and the array width well
+/// within `u32` (the backing array has at most `2 * MAX_LEAVES - 1` nodes), so
+/// the `u32` index arithmetic in this module cannot overflow or truncate in
+/// practice. Matches the crate-wide [`crate::MAX_GROUP_SIZE`].
+pub const MAX_LEAVES: u32 = 1 << 16;
+
 /// RFC 9420 Appendix C array-based tree math.
 ///
 /// The tree is represented as a flat array of nodes for a **perfect** binary
@@ -315,7 +323,8 @@ impl RatchetTree {
     /// # Errors
     ///
     /// Returns [`MlsError`] if the key package cipher suite does not match the
-    /// tree, or on internal tree-math inconsistency.
+    /// tree, or if the group would exceed [`MAX_LEAVES`], or on internal
+    /// tree-math inconsistency.
     pub fn add_leaf(&mut self, key_package: KeyPackage) -> Result<u32> {
         if key_package.cipher_suite != self.suite {
             return Err(MlsError::TreeKemError(
@@ -326,15 +335,21 @@ impl RatchetTree {
         let leaf_index = self
             .first_blank_leaf()
             .unwrap_or_else(|| self.leaf_capacity());
-        self.grow_to_fit(leaf_index);
+        if leaf_index >= MAX_LEAVES {
+            return Err(MlsError::TreeKemError(format!(
+                "group would exceed MAX_LEAVES ({MAX_LEAVES})"
+            )));
+        }
+        // `set_leaf_node` grows the backing array to fit `leaf_index`.
         self.set_leaf_node(leaf_index, key_package);
 
-        // Register the new leaf as unmerged in each non-blank ancestor.
+        // Register the new leaf as unmerged in each non-blank ancestor, keeping
+        // the list sorted so the tree hash is independent of insertion order.
         let width = self.width();
         for ancestor in treemath::direct_path(treemath::leaf_to_node(leaf_index), width)? {
             if let Some(Node::Parent(parent)) = self.nodes[ancestor as usize].as_mut() {
-                if !parent.unmerged_leaves.contains(&leaf_index) {
-                    parent.unmerged_leaves.push(leaf_index);
+                if let Err(pos) = parent.unmerged_leaves.binary_search(&leaf_index) {
+                    parent.unmerged_leaves.insert(pos, leaf_index);
                 }
             }
         }
@@ -370,6 +385,14 @@ impl RatchetTree {
     /// Two instances with the same public tree produce the same hash; any
     /// change to a node's public key, a leaf's key package, or the tree shape
     /// changes the hash.
+    ///
+    /// Note: like the rest of this crate, the hash is computed with BLAKE3
+    /// (via [`struct@Hash`]) regardless of the cipher suite's advertised hash field —
+    /// see the crate-level note on hash agility. This is self-consistent for
+    /// all in-stack members (every member hashes identically), but it means the
+    /// suite's hash field is not honoured here; cross-stack interop is out of
+    /// scope per ADR-002 and a per-suite hash is tracked for the P4 key-schedule
+    /// rework.
     ///
     /// # Errors
     ///
@@ -439,8 +462,14 @@ impl RatchetTree {
 
 /// Length-prefix `data` (4-byte big-endian length) and append to `buf`, so the
 /// concatenation of fields is unambiguous.
+///
+/// Inputs are bounded (key packages, 32–64 byte hashes, and `unmerged_leaves`
+/// lists capped by [`MAX_LEAVES`]), so the length always fits in `u32`; the
+/// saturating conversion is a defensive guard that can never trigger in
+/// practice.
 fn push_len_prefixed(buf: &mut Vec<u8>, data: &[u8]) {
-    buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    let len = u32::try_from(data.len()).unwrap_or(u32::MAX);
+    buf.extend_from_slice(&len.to_be_bytes());
     buf.extend_from_slice(data);
 }
 
@@ -457,10 +486,20 @@ fn push_len_prefixed(buf: &mut Vec<u8>, data: &[u8]) {
 /// # Errors
 ///
 /// Returns [`MlsError`] if the HKDF expansion fails.
-pub fn derive_key_pair(suite: CipherSuite, node_secret: &[u8]) -> Result<(Vec<u8>, MlKemSecretKey)> {
+pub fn derive_key_pair(
+    suite: CipherSuite,
+    node_secret: &[u8],
+) -> Result<(Vec<u8>, MlKemSecretKey)> {
     let ks = KeySchedule::new(suite);
     // FIPS 203 keygen needs a 64-byte seed (d ‖ z).
     let mut seed = ks.derive_key(&[], node_secret, b"MLS 1.0 DeriveKeyPair", 64)?;
+    if seed.len() != 64 {
+        seed.zeroize();
+        return Err(MlsError::CryptoError(format!(
+            "DeriveKeyPair expected 64 seed bytes, got {}",
+            seed.len()
+        )));
+    }
     let mut d = [0u8; 32];
     let mut z = [0u8; 32];
     d.copy_from_slice(&seed[..32]);
@@ -600,12 +639,22 @@ mod tests {
                 // direct path ends at the root; copath aligns 1:1 with it
                 let dp = direct_path(x, width).unwrap();
                 if let Some(&last) = dp.last() {
-                    assert_eq!(last, r, "width={width}: direct path of {x} must end at root");
+                    assert_eq!(
+                        last, r,
+                        "width={width}: direct path of {x} must end at root"
+                    );
                 }
                 let cp = copath(x, width).unwrap();
-                assert_eq!(cp.len(), dp.len(), "width={width}: copath/direct_path length");
+                assert_eq!(
+                    cp.len(),
+                    dp.len(),
+                    "width={width}: copath/direct_path length"
+                );
                 for &c in &cp {
-                    assert!(c < width, "copath node {c} of {x} out of range, width={width}");
+                    assert!(
+                        c < width,
+                        "copath node {c} of {x} out of range, width={width}"
+                    );
                 }
             }
         }
@@ -718,5 +767,94 @@ mod tests {
         .unwrap();
         let kp = make_key_package(); // default suite
         assert!(RatchetTree::new(kp, other).is_err());
+    }
+
+    #[test]
+    fn test_leaf_node_index_conversions() {
+        assert!(is_leaf(0) && is_leaf(2) && is_leaf(4));
+        assert!(!is_leaf(1) && !is_leaf(3));
+        assert_eq!(leaf_to_node(0), 0);
+        assert_eq!(leaf_to_node(1), 2);
+        assert_eq!(leaf_to_node(3), 6);
+        assert_eq!(node_to_leaf(0).unwrap(), 0);
+        assert_eq!(node_to_leaf(4).unwrap(), 2);
+        assert!(node_to_leaf(1).is_err()); // odd index is not a leaf
+        assert!(node_to_leaf(3).is_err());
+    }
+
+    #[test]
+    fn test_blank_leaf_error_paths() {
+        let suite = CipherSuite::default();
+        let mut tree = RatchetTree::new(make_key_package(), suite).unwrap();
+        // out of range
+        assert!(tree.blank_leaf(99).is_err());
+        // blank the only leaf, then double-blank must error
+        tree.blank_leaf(0).unwrap();
+        assert_eq!(tree.active_leaf_count(), 0);
+        assert!(tree.blank_leaf(0).is_err());
+        // tree_hash over a fully-blank tree must still succeed deterministically
+        let h1 = tree.tree_hash().unwrap();
+        let h2 = tree.tree_hash().unwrap();
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn test_add_leaf_suite_mismatch_rejected() {
+        let suite = CipherSuite::default();
+        let mut tree = RatchetTree::new(make_key_package(), suite).unwrap();
+        // a key package on a different suite
+        let other = CipherSuite::from_id(
+            crate::crypto::CipherSuiteId::SPEC2_MLS_256_MLKEM1024_CHACHA20POLY1305_SHA512_MLDSA87,
+        )
+        .unwrap();
+        let kp_other = {
+            let keypair = KeyPair::generate(other);
+            let cred = Credential::new_basic(MemberId::generate(), None, &keypair, other).unwrap();
+            KeyPackage::new(keypair, cred).unwrap()
+        };
+        assert!(tree.add_leaf(kp_other).is_err());
+    }
+
+    #[test]
+    fn test_growth_boundary_beyond_capacity_four() {
+        let suite = CipherSuite::default();
+        let mut tree = RatchetTree::new(make_key_package(), suite).unwrap();
+        // add up to 7 members, crossing the 4->8 perfect-tree growth boundary
+        for expected_idx in 1..=6u32 {
+            let idx = tree.add_leaf(make_key_package()).unwrap();
+            assert_eq!(idx, expected_idx);
+        }
+        assert_eq!(tree.active_leaf_count(), 7);
+        assert_eq!(tree.leaf_capacity(), 8); // grew to perfect 8-leaf tree
+        assert_eq!(tree.width(), 15);
+        // every active leaf must be retrievable and distinct
+        for leaf in 0..7u32 {
+            assert!(
+                tree.leaf(leaf).is_some(),
+                "leaf {leaf} missing after growth"
+            );
+        }
+        assert!(tree.leaf(7).is_none()); // padding leaf is blank
+                                         // hash is stable across recomputation
+        assert_eq!(tree.tree_hash().unwrap(), tree.tree_hash().unwrap());
+    }
+
+    #[test]
+    fn test_derive_key_pair_high_security_suite() {
+        // exercise the ML-KEM-1024 / SHA-512 suite path through DeriveKeyPair
+        let suite = CipherSuite::from_id(
+            crate::crypto::CipherSuiteId::SPEC2_MLS_256_MLKEM1024_CHACHA20POLY1305_SHA512_MLDSA87,
+        )
+        .unwrap();
+        let secret = vec![3u8; 32];
+        let (pk1, sk1) = derive_key_pair(suite, &secret).unwrap();
+        let (pk2, _) = derive_key_pair(suite, &secret).unwrap();
+        assert_eq!(pk1, pk2, "deterministic for ML-KEM-1024 suite");
+
+        let kem = MlKem::new(suite.ml_kem_variant());
+        let pk = saorsa_pqc::api::MlKemPublicKey::from_bytes(suite.ml_kem_variant(), &pk1).unwrap();
+        let (ss_send, ct) = kem.encapsulate(&pk).unwrap();
+        let ss_recv = kem.decapsulate(&sk1, &ct).unwrap();
+        assert_eq!(ss_send.to_bytes(), ss_recv.to_bytes());
     }
 }
