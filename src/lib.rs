@@ -10,19 +10,28 @@
 //! [RFC 9420](https://datatracker.ietf.org/doc/rfc9420/) for secure group communication,
 //! enhanced with post-quantum cryptographic algorithms for quantum resistance.
 //!
-//! MLS provides:
+//! Two group planes are provided:
 //!
-//! - **End-to-end encryption** for group messaging
-//! - **Forward secrecy** - past messages remain secure even if keys are compromised
-//! - **Post-compromise security** - the group can heal after a compromise
-//! - **Asynchronous group management** - members can join/leave without real-time coordination
-//! - **Scalable tree-based key derivation** using `TreeKEM`
+//! - [`treekem_group::TreeKemGroup`] — the real **TreeKEM** plane (RFC 9420
+//!   subset): a ratchet tree with per-node ML-KEM keypairs, UpdatePath
+//!   commits, key-schedule chaining and parent hashes. This delivers
+//!   **forward secrecy** (past messages stay secure after a key compromise) and
+//!   **post-compromise security** (the group heals after a compromise). Use this
+//!   for new code.
+//! - [`MlsGroup`] — a **legacy per-epoch group-shared-secret (GSS)** plane that
+//!   does *not* provide FS/PCS (every epoch member shares one secret). Retained
+//!   for backward compatibility; see ADR-002 for the migration plan.
+//!
+//! Both planes are post-quantum (ML-KEM, ML-DSA/SLH-DSA, ChaCha20-Poly1305,
+//! HKDF) and support end-to-end encryption and asynchronous join/leave.
 //!
 //! ## Core Components
 //!
+//! - `treekem` / `key_schedule` / `treekem_group`: the real TreeKEM stack
+//!   (ratchet tree, MLS key schedule, and the `TreeKemGroup` API)
 //! - `protocol`: MLS protocol message structures and state machines
 //! - `crypto`: Cryptographic primitives and key derivation
-//! - `group`: Group state management and `TreeKEM` operations
+//! - `group`: the legacy GSS `MlsGroup`
 //! - `member`: Member identity and authentication
 //!
 //! ## Example Usage

@@ -63,7 +63,15 @@ impl ReplayWindow {
 
 pub use crate::protocol::{GroupConfig, GroupId};
 
-/// MLS group state with `TreeKEM` key management - FIXED VERSION
+/// Legacy per-epoch **group shared secret (GSS)** plane.
+///
+/// NOTE: despite the historical name, this type does **not** provide TreeKEM
+/// forward secrecy or post-compromise security — every member of an epoch
+/// shares one secret (see ADR-002). It is retained for backward compatibility.
+/// For real FS/PCS use [`crate::treekem_group::TreeKemGroup`], which implements
+/// the RFC 9420 TreeKEM subset (ratchet tree + UpdatePath + key-schedule
+/// chaining + parent hashes). Migration of consumers off this type is tracked in
+/// ADR-002 (P6).
 #[derive(Debug)]
 pub struct MlsGroup {
     config: GroupConfig,
