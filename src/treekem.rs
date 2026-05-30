@@ -344,15 +344,72 @@ impl RatchetTree {
 
     /// Reconstruct a public-only tree (no owner, no secrets) from an exported
     /// node array — the joiner's starting point before [`Self::attach_owner`].
-    #[must_use]
-    pub fn from_public_nodes(suite: CipherSuite, nodes: Vec<Option<Node>>) -> Self {
-        Self {
+    ///
+    /// Validates the untrusted node array: the length must be a valid
+    /// perfect-tree width (`2^k - 1`); every leaf node's key package must match
+    /// `suite`, be self-consistent (`KeyPackage::verify`), and sit at an even
+    /// index; every parent node must sit at an odd index with in-range
+    /// `unmerged_leaves`. This is the admission/sanity gate that keeps later
+    /// tree math and signature checks panic-free on hostile input.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MlsError`] if the node array is malformed or any leaf key
+    /// package is invalid for `suite`.
+    pub fn from_public_nodes(suite: CipherSuite, nodes: Vec<Option<Node>>) -> Result<Self> {
+        let width = nodes.len() as u64;
+        // width must be 2^(k+1) - 1 (a perfect-tree node count), and fit u32.
+        if width == 0 || width > u64::from(u32::MAX) || (width + 1).count_ones() != 1 {
+            return Err(MlsError::TreeKemError(format!(
+                "invalid ratchet-tree node count {width}"
+            )));
+        }
+        let leaf_capacity = width.div_ceil(2) as u32;
+        for (idx, node) in nodes.iter().enumerate() {
+            let idx = idx as u32;
+            match node {
+                Some(Node::Leaf(data)) => {
+                    if idx & 1 != 0 {
+                        return Err(MlsError::TreeKemError(format!(
+                            "leaf node at odd index {idx}"
+                        )));
+                    }
+                    if data.key_package.cipher_suite != suite {
+                        return Err(MlsError::TreeKemError(
+                            "leaf key package cipher suite does not match tree".to_string(),
+                        ));
+                    }
+                    // NOTE: `encryption_key` legitimately diverges from
+                    // `key_package.agreement_key` once a member's leaf has been
+                    // rotated by an UpdatePath, so we do NOT require equality.
+                    if !data.key_package.verify().unwrap_or(false) {
+                        return Err(MlsError::TreeKemError(
+                            "leaf key package self-signature is invalid".to_string(),
+                        ));
+                    }
+                }
+                Some(Node::Parent(data)) => {
+                    if idx & 1 == 0 {
+                        return Err(MlsError::TreeKemError(format!(
+                            "parent node at even index {idx}"
+                        )));
+                    }
+                    if data.unmerged_leaves.iter().any(|&l| l >= leaf_capacity) {
+                        return Err(MlsError::TreeKemError(
+                            "parent unmerged_leaves index out of range".to_string(),
+                        ));
+                    }
+                }
+                None => {}
+            }
+        }
+        Ok(Self {
             suite,
             nodes,
             own_leaf: None,
             own_leaf_secret: None,
             path_secrets: std::collections::BTreeMap::new(),
-        }
+        })
     }
 
     /// Find the leaf index whose key package equals `key_package`, if any.
@@ -398,6 +455,22 @@ impl RatchetTree {
         own_leaf_secret: Option<Vec<u8>>,
         path_secrets: Vec<(u32, Vec<u8>)>,
     ) -> Result<()> {
+        let width = self.width();
+        if let Some(leaf) = own_leaf {
+            if leaf >= self.leaf_capacity() || self.leaf(leaf).is_none() {
+                return Err(MlsError::TreeKemError(format!(
+                    "snapshot owner leaf {leaf} is out of range or blank"
+                )));
+            }
+        }
+        // Path secrets are keyed by parent (odd) node indices within the tree.
+        for (idx, _) in &path_secrets {
+            if *idx >= width || idx & 1 == 0 {
+                return Err(MlsError::TreeKemError(format!(
+                    "snapshot path secret has invalid node index {idx}"
+                )));
+            }
+        }
         self.own_leaf = own_leaf;
         self.own_leaf_secret = match own_leaf_secret {
             Some(bytes) => Some(
