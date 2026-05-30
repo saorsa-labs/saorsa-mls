@@ -8,30 +8,35 @@
 //! post-compromise security (PCS) possible, per
 //! [ADR-002](../../docs/adr/ADR-002-real-treekem-for-forward-secrecy-and-pcs.md).
 //!
-//! Scope of this module (phase P2):
+//! Scope of this module (phases P2–P3):
 //!
 //! - [`treemath`]: RFC 9420 Appendix C array-based tree math. The tree is kept
 //!   as a **perfect** binary tree (its leaf count is always rounded up to a
 //!   power of two, with trailing blank leaves), which is what makes the simple
 //!   `parent`/`left`/`right`/`sibling` index formulas correct — see the note
 //!   on that module.
-//! - [`Node`]/[`RatchetTree`]: the public tree state — each node carries a KEM
-//!   *public* key (ML-KEM), leaves bind to a member [`KeyPackage`].
+//! - [`Node`]/[`RatchetTree`]: the tree state — the public nodes (each carrying
+//!   a KEM public key, leaves bound to a member [`KeyPackage`]) plus this
+//!   member's private path secrets and owned-leaf secret key.
 //! - [`derive_key_pair`]: deterministic `DeriveKeyPair` — turns a node secret
 //!   into the *same* ML-KEM keypair for every member who learns that secret.
-//!   This is the primitive the UpdatePath (phase P3) relies on.
-//! - [`RatchetTree::tree_hash`]: a deterministic hash over the public tree
-//!   state.
+//! - [`RatchetTree::tree_hash`]: a deterministic hash over the public tree state.
+//! - [`RatchetTree::generate_update_path`] / [`RatchetTree::process_update_path`]
+//!   (P3): the UpdatePath mechanism that delivers forward secrecy and
+//!   post-compromise security — a committer rotates its direct path and seals a
+//!   fresh path secret to each copath subtree, and every other member derives
+//!   the same `commit_secret`.
 //!
-//! UpdatePath generation/processing and the per-node *private* keys that ride
-//! on it are implemented in phase P3 on top of this structure.
+//! The key-schedule chaining that consumes `commit_secret` into epoch secrets is
+//! phase P4; Welcome / `from_welcome` / serde are phase P5.
 
 use crate::{
-    crypto::{CipherSuite, Hash, KeySchedule},
+    crypto::{AeadCipher, CipherSuite, Hash, KeySchedule},
     member::KeyPackage,
     MlsError, Result,
 };
-use saorsa_pqc::api::{MlKem, MlKemSecretKey};
+use saorsa_pqc::api::{MlKem, MlKemCiphertext, MlKemPublicKey, MlKemSecretKey};
+use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
 /// Upper bound on the number of leaves (members) a ratchet tree may hold.
@@ -238,16 +243,42 @@ pub struct ParentNodeData {
     pub unmerged_leaves: Vec<u32>,
 }
 
-/// The public ratchet-tree state shared by all members of a group.
+/// The ratchet-tree state held by one member of a group.
 ///
-/// This holds only **public** material (KEM public keys and key packages).
-/// Per-member private path secrets are layered on top in phase P3.
-#[derive(Clone, Debug)]
+/// The `nodes` array is the **public** tree (KEM public keys and key packages),
+/// identical across all members. The remaining fields are this member's
+/// **private** view: the leaf it owns and the path secrets / leaf secret key it
+/// is entitled to. Private material is redacted from the [`Debug`] impl and the
+/// path secrets are zeroized on drop.
+#[derive(Clone)]
 pub struct RatchetTree {
     suite: CipherSuite,
     /// Perfect-tree array of `2*L - 1` slots (`L` a power of two). `None` marks
     /// a blank node.
     nodes: Vec<Option<Node>>,
+    /// The leaf index owned by this member, if this instance is a participant
+    /// (as opposed to a public-tree-only view).
+    own_leaf: Option<u32>,
+    /// Secret key for this member's own leaf (rotates when the member commits an
+    /// UpdatePath). Derived from the member's `KeyPackage` initially.
+    own_leaf_secret: Option<MlKemSecretKey>,
+    /// Path secrets this member knows, keyed by node index. The member can
+    /// re-derive each node's KEM keypair from its path secret via
+    /// [`derive_key_pair`].
+    path_secrets: std::collections::BTreeMap<u32, zeroize::Zeroizing<Vec<u8>>>,
+}
+
+impl std::fmt::Debug for RatchetTree {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RatchetTree")
+            .field("suite", &self.suite)
+            .field("width", &self.width())
+            .field("active_leaves", &self.active_leaf_count())
+            .field("own_leaf", &self.own_leaf)
+            .field("path_secrets", &"<redacted>")
+            .field("own_leaf_secret", &"<redacted>")
+            .finish_non_exhaustive()
+    }
 }
 
 impl RatchetTree {
@@ -266,9 +297,35 @@ impl RatchetTree {
         let mut tree = Self {
             suite,
             nodes: vec![None],
+            own_leaf: None,
+            own_leaf_secret: None,
+            path_secrets: std::collections::BTreeMap::new(),
         };
         tree.set_leaf_node(0, creator);
         Ok(tree)
+    }
+
+    /// Mark `leaf` as owned by this member and attach the leaf's KEM secret key
+    /// (from the member's `KeyPackage`), enabling UpdatePath processing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MlsError`] if `leaf` is blank/out of range.
+    pub fn attach_owner(&mut self, leaf: u32, leaf_kem_secret: MlKemSecretKey) -> Result<()> {
+        if self.leaf(leaf).is_none() {
+            return Err(MlsError::TreeKemError(format!(
+                "cannot own blank/out-of-range leaf {leaf}"
+            )));
+        }
+        self.own_leaf = Some(leaf);
+        self.own_leaf_secret = Some(leaf_kem_secret);
+        Ok(())
+    }
+
+    /// The leaf index owned by this member, if any.
+    #[must_use]
+    pub fn own_leaf(&self) -> Option<u32> {
+        self.own_leaf
     }
 
     /// Cipher suite this tree is pinned to.
@@ -409,6 +466,9 @@ impl RatchetTree {
             match self.node(idx) {
                 Some(Node::Leaf(data)) => {
                     input.push(0x01); // present
+                                      // bind the (rotating) leaf KEM key as well as the stable
+                                      // key package, so an UpdatePath leaf rotation changes the hash
+                    push_len_prefixed(&mut input, &data.encryption_key);
                     let kp = postcard::to_stdvec(&data.key_package)
                         .map_err(|e| MlsError::SerializationError(e.to_string()))?;
                     push_len_prefixed(&mut input, &kp);
@@ -458,6 +518,274 @@ impl RatchetTree {
             key_package,
         }));
     }
+
+    fn set_leaf_encryption_key(&mut self, leaf: u32, key: Vec<u8>) -> Result<()> {
+        let idx = treemath::leaf_to_node(leaf) as usize;
+        match self.nodes.get_mut(idx).and_then(Option::as_mut) {
+            Some(Node::Leaf(data)) => {
+                data.encryption_key = key;
+                Ok(())
+            }
+            _ => Err(MlsError::TreeKemError(format!(
+                "leaf {leaf} is blank; cannot set encryption key"
+            ))),
+        }
+    }
+
+    /// The current KEM public key for node `idx` (leaf or parent).
+    fn node_public_key(&self, idx: u32) -> Result<Vec<u8>> {
+        match self.node(idx) {
+            Some(Node::Leaf(d)) => Ok(d.encryption_key.clone()),
+            Some(Node::Parent(d)) => Ok(d.encryption_key.clone()),
+            None => Err(MlsError::TreeKemError(format!("node {idx} is blank"))),
+        }
+    }
+
+    /// Resolution of `node` per RFC 9420 §7.6: the ordered list of non-blank
+    /// node indices that cover the subtree rooted at `node` for encryption. A
+    /// non-blank node resolves to itself (plus its unmerged leaves); a blank
+    /// parent resolves to the concatenation of its children's resolutions; a
+    /// blank leaf resolves to nothing.
+    fn resolution(&self, node: u32) -> Result<Vec<u32>> {
+        match self.node(node) {
+            Some(Node::Leaf(_)) => Ok(vec![node]),
+            Some(Node::Parent(p)) => {
+                let mut out = vec![node];
+                for &leaf in &p.unmerged_leaves {
+                    out.push(treemath::leaf_to_node(leaf));
+                }
+                Ok(out)
+            }
+            None => {
+                if treemath::is_leaf(node) {
+                    Ok(Vec::new())
+                } else {
+                    let mut out = self.resolution(treemath::left(node)?)?;
+                    out.extend(self.resolution(treemath::right(node)?)?);
+                    Ok(out)
+                }
+            }
+        }
+    }
+
+    /// `DeriveSecret(secret, label)` — fixed-length HKDF-Expand used to chain
+    /// path secrets and to derive the commit secret.
+    fn derive_secret(&self, secret: &[u8], label: &str) -> Result<Vec<u8>> {
+        KeySchedule::new(self.suite).derive_secret(secret, label, &[])
+    }
+
+    /// Is `node` an ancestor of `descendant` (or equal to it)?
+    fn is_ancestor_or_self(&self, node: u32, descendant: u32, width: u32) -> Result<bool> {
+        if node == descendant {
+            return Ok(true);
+        }
+        Ok(treemath::direct_path(descendant, width)?.contains(&node))
+    }
+
+    /// The KEM secret key this member holds for `node`, if any: its own leaf
+    /// secret, or a key derived from a known path secret.
+    fn secret_for_node(&self, node: u32) -> Result<Option<MlKemSecretKey>> {
+        if Some(node) == self.own_leaf.map(treemath::leaf_to_node) {
+            return Ok(self.own_leaf_secret.clone());
+        }
+        if let Some(ps) = self.path_secrets.get(&node) {
+            let (_pub, sk) = derive_key_pair(self.suite, ps)?;
+            return Ok(Some(sk));
+        }
+        Ok(None)
+    }
+
+    /// Generate an UpdatePath rooted at this member's leaf (an MLS Commit's path
+    /// component): sample a fresh leaf secret, rotate the leaf and every node on
+    /// the direct path to the root with freshly derived KEM keypairs, and seal
+    /// each path secret to the resolution of the corresponding copath node.
+    ///
+    /// Returns the [`UpdatePath`] to broadcast and the resulting `commit_secret`
+    /// (the input to the next epoch's key schedule — phase P4). This is the
+    /// mechanism that delivers post-compromise security: an attacker who lacks
+    /// the fresh leaf secret cannot derive the new `commit_secret`.
+    ///
+    /// `leaf_secret_seed` is normally `None` (fresh randomness); tests may pass a
+    /// fixed seed for determinism.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MlsError`] if this instance owns no leaf, or on crypto/tree
+    /// failure.
+    pub fn generate_update_path(
+        &mut self,
+        leaf_secret_seed: Option<&[u8]>,
+    ) -> Result<(UpdatePath, zeroize::Zeroizing<Vec<u8>>)> {
+        let leaf = self
+            .own_leaf
+            .ok_or_else(|| MlsError::TreeKemError("instance owns no leaf".to_string()))?;
+        let width = self.width();
+        let leaf_node = treemath::leaf_to_node(leaf);
+        let direct = treemath::direct_path(leaf_node, width)?;
+        let copath = treemath::copath(leaf_node, width)?;
+
+        // fresh leaf secret + rotated leaf keypair
+        let leaf_secret = zeroize::Zeroizing::new(
+            leaf_secret_seed
+                .map(<[u8]>::to_vec)
+                .unwrap_or_else(|| crate::crypto::random_bytes(self.suite.hash_size())),
+        );
+        let (leaf_pub, leaf_sk) = derive_key_pair(self.suite, &leaf_secret)?;
+        self.set_leaf_encryption_key(leaf, leaf_pub.clone())?;
+        self.own_leaf_secret = Some(leaf_sk);
+
+        // chain a path secret for each direct-path node, rotating its keypair
+        self.path_secrets.clear();
+        let mut prev = leaf_secret;
+        let mut node_path_secrets: Vec<zeroize::Zeroizing<Vec<u8>>> = Vec::new();
+        for &dn in &direct {
+            let ps = zeroize::Zeroizing::new(self.derive_secret(&prev, "path")?);
+            let (pub_i, _sk_i) = derive_key_pair(self.suite, &ps)?;
+            self.nodes[dn as usize] = Some(Node::Parent(ParentNodeData {
+                encryption_key: pub_i,
+                parent_hash: Vec::new(),
+                unmerged_leaves: Vec::new(),
+            }));
+            self.path_secrets.insert(dn, ps.clone());
+            node_path_secrets.push(ps.clone());
+            prev = ps;
+        }
+        let commit_secret = zeroize::Zeroizing::new(self.derive_secret(&prev, "path")?);
+
+        // seal each path secret to the resolution of the matching copath node
+        let mut up_nodes = Vec::with_capacity(direct.len());
+        for ((&dn, ps_i), &cn) in direct
+            .iter()
+            .zip(node_path_secrets.iter())
+            .zip(copath.iter())
+        {
+            let recipients = self.resolution(cn)?;
+            let mut cts = Vec::with_capacity(recipients.len());
+            for r in recipients {
+                let rpub = self.node_public_key(r)?;
+                cts.push(seal_to(self.suite, &rpub, ps_i)?);
+            }
+            up_nodes.push(UpdatePathNode {
+                encryption_key: self.node_public_key(dn)?,
+                encrypted_path_secret: cts,
+            });
+        }
+
+        Ok((
+            UpdatePath {
+                leaf_index: leaf,
+                leaf_encryption_key: leaf_pub,
+                nodes: up_nodes,
+            },
+            commit_secret,
+        ))
+    }
+
+    /// Process an [`UpdatePath`] produced by another member's
+    /// [`Self::generate_update_path`], installing the new public keys and deriving the
+    /// same `commit_secret` the committer computed.
+    ///
+    /// This is the forward-secrecy / post-compromise-security mechanism on the
+    /// receiving side: only a member entitled to a copath subtree can decrypt
+    /// the path secret sealed to it, and from it derive the new epoch's secret.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MlsError`] if this instance owns no leaf, if no path secret is
+    /// decryptable by this member, if a derived public key does not match the
+    /// committer's, or on crypto/tree failure.
+    pub fn process_update_path(
+        &mut self,
+        update_path: &UpdatePath,
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+        let my_leaf = self
+            .own_leaf
+            .ok_or_else(|| MlsError::TreeKemError("instance owns no leaf".to_string()))?;
+        if update_path.leaf_index == my_leaf {
+            return Err(MlsError::TreeKemError(
+                "cannot process own UpdatePath; use the commit_secret from generate".to_string(),
+            ));
+        }
+        let width = self.width();
+        let my_node = treemath::leaf_to_node(my_leaf);
+        let committer_node = treemath::leaf_to_node(update_path.leaf_index);
+        let direct = treemath::direct_path(committer_node, width)?;
+        let copath = treemath::copath(committer_node, width)?;
+        if update_path.nodes.len() != direct.len() {
+            return Err(MlsError::TreeKemError(
+                "UpdatePath length does not match direct path".to_string(),
+            ));
+        }
+
+        // install the committer's new leaf key and all direct-path node keys
+        self.set_leaf_encryption_key(
+            update_path.leaf_index,
+            update_path.leaf_encryption_key.clone(),
+        )?;
+        for (&dn, node) in direct.iter().zip(update_path.nodes.iter()) {
+            self.nodes[dn as usize] = Some(Node::Parent(ParentNodeData {
+                encryption_key: node.encryption_key.clone(),
+                parent_hash: Vec::new(),
+                unmerged_leaves: Vec::new(),
+            }));
+        }
+
+        // find the overlap: the copath node whose subtree contains my leaf
+        let mut decrypted: Option<(usize, zeroize::Zeroizing<Vec<u8>>)> = None;
+        for (i, &cn) in copath.iter().enumerate() {
+            if !self.is_ancestor_or_self(cn, my_node, width)? {
+                continue;
+            }
+            let recipients = self.resolution(cn)?;
+            for (j, &r) in recipients.iter().enumerate() {
+                if let Some(sk) = self.secret_for_node(r)? {
+                    let ct = update_path.nodes[i]
+                        .encrypted_path_secret
+                        .get(j)
+                        .ok_or_else(|| {
+                            MlsError::TreeKemError(
+                                "missing ciphertext for resolution slot".to_string(),
+                            )
+                        })?;
+                    let ps = open_from(self.suite, &sk, ct)?;
+                    decrypted = Some((i, zeroize::Zeroizing::new(ps)));
+                    break;
+                }
+            }
+            if decrypted.is_some() {
+                break;
+            }
+        }
+        let (start, ps_start) = decrypted.ok_or_else(|| {
+            MlsError::TreeKemError("no decryptable path secret for this member".to_string())
+        })?;
+
+        // re-derive path secrets from the overlap node up to the root, verifying
+        // each derived public key matches the committer's
+        let mut prev = ps_start;
+        for (i, (&dn, node)) in direct
+            .iter()
+            .zip(update_path.nodes.iter())
+            .enumerate()
+            .skip(start)
+        {
+            let ps = if i == start {
+                prev.clone()
+            } else {
+                zeroize::Zeroizing::new(self.derive_secret(&prev, "path")?)
+            };
+            let (pub_i, _sk) = derive_key_pair(self.suite, &ps)?;
+            if pub_i != node.encryption_key {
+                return Err(MlsError::TreeKemError(format!(
+                    "derived public key for node {dn} does not match UpdatePath"
+                )));
+            }
+            self.path_secrets.insert(dn, ps.clone());
+            prev = ps;
+        }
+        let commit_secret = zeroize::Zeroizing::new(self.derive_secret(&prev, "path")?);
+        Ok(commit_secret)
+    }
 }
 
 /// Length-prefix `data` (4-byte big-endian length) and append to `buf`, so the
@@ -471,6 +799,86 @@ fn push_len_prefixed(buf: &mut Vec<u8>, data: &[u8]) {
     let len = u32::try_from(data.len()).unwrap_or(u32::MAX);
     buf.extend_from_slice(&len.to_be_bytes());
     buf.extend_from_slice(data);
+}
+
+/// An UpdatePath: the path component of an MLS Commit. Rotates the committer's
+/// leaf and every node on its direct path, sealing each new path secret to the
+/// members entitled to it. See [`RatchetTree::generate_update_path`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UpdatePath {
+    /// Leaf index of the committer.
+    pub leaf_index: u32,
+    /// The committer's new leaf KEM public key.
+    pub leaf_encryption_key: Vec<u8>,
+    /// One entry per node on the committer's direct path, ordered leaf → root.
+    pub nodes: Vec<UpdatePathNode>,
+}
+
+/// One node of an [`UpdatePath`]: the node's new public key plus the path secret
+/// sealed to each member in the corresponding copath node's resolution (in
+/// resolution order).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UpdatePathNode {
+    /// The node's freshly derived KEM public key.
+    pub encryption_key: Vec<u8>,
+    /// Sealed path secret, one ciphertext per resolved recipient node.
+    pub encrypted_path_secret: Vec<HpkeCiphertext>,
+}
+
+/// An ML-KEM-encapsulated, AEAD-sealed secret addressed to a single recipient.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HpkeCiphertext {
+    /// ML-KEM ciphertext (encapsulation to the recipient's KEM public key).
+    pub kem_ct: Vec<u8>,
+    /// AEAD ciphertext (`nonce ‖ ct`) of the sealed secret under the KEM-derived key.
+    pub aead_ct: Vec<u8>,
+}
+
+/// Seal `plaintext` to a recipient's KEM public key: ML-KEM encapsulate, then
+/// HKDF the shared secret into a key/nonce and AEAD-seal.
+fn seal_to(suite: CipherSuite, recipient_pub: &[u8], plaintext: &[u8]) -> Result<HpkeCiphertext> {
+    let pk = MlKemPublicKey::from_bytes(suite.ml_kem_variant(), recipient_pub)
+        .map_err(|e| MlsError::CryptoError(format!("invalid recipient KEM key: {e:?}")))?;
+    let kem = MlKem::new(suite.ml_kem_variant());
+    let (shared, ct) = kem
+        .encapsulate(&pk)
+        .map_err(|e| MlsError::CryptoError(format!("encapsulation failed: {e:?}")))?;
+    let shared_b = shared.to_bytes();
+    let ks = KeySchedule::new(suite);
+    let key = ks.derive_key(&[], &shared_b, b"saorsa treekem path key", suite.key_size())?;
+    let nonce = ks.derive_key(
+        &[],
+        &shared_b,
+        b"saorsa treekem path nonce",
+        suite.nonce_size(),
+    )?;
+    let aead = AeadCipher::new(key, suite)?;
+    let aead_ct = aead.encrypt(&nonce, plaintext, &[])?;
+    Ok(HpkeCiphertext {
+        kem_ct: ct.to_bytes(),
+        aead_ct,
+    })
+}
+
+/// Inverse of [`seal_to`]: decapsulate with `my_sk` and AEAD-open.
+fn open_from(suite: CipherSuite, my_sk: &MlKemSecretKey, hc: &HpkeCiphertext) -> Result<Vec<u8>> {
+    let ct = MlKemCiphertext::from_bytes(suite.ml_kem_variant(), &hc.kem_ct)
+        .map_err(|e| MlsError::CryptoError(format!("invalid KEM ciphertext: {e:?}")))?;
+    let kem = MlKem::new(suite.ml_kem_variant());
+    let shared = kem
+        .decapsulate(my_sk, &ct)
+        .map_err(|e| MlsError::CryptoError(format!("decapsulation failed: {e:?}")))?;
+    let shared_b = shared.to_bytes();
+    let ks = KeySchedule::new(suite);
+    let key = ks.derive_key(&[], &shared_b, b"saorsa treekem path key", suite.key_size())?;
+    let nonce = ks.derive_key(
+        &[],
+        &shared_b,
+        b"saorsa treekem path nonce",
+        suite.nonce_size(),
+    )?;
+    let aead = AeadCipher::new(key, suite)?;
+    aead.decrypt(&nonce, &hc.aead_ct, &[])
 }
 
 /// Deterministically derive a node's ML-KEM keypair from a node secret
@@ -518,7 +926,7 @@ mod tests {
     use super::treemath::*;
     use super::*;
     use crate::crypto::KeyPair;
-    use crate::member::{Credential, KeyPackage, MemberId};
+    use crate::member::{Credential, KeyPackage, MemberId, MemberIdentity};
 
     // ---- tree math KATs (hand-verified against RFC 9420 Appendix C,
     //      perfect-tree array model as used by OpenMLS) ----
@@ -856,5 +1264,135 @@ mod tests {
         let (ss_send, ct) = kem.encapsulate(&pk).unwrap();
         let ss_recv = kem.decapsulate(&sk1, &ct).unwrap();
         assert_eq!(ss_send.to_bytes(), ss_recv.to_bytes());
+    }
+
+    // ---- P3: UpdatePath generation / processing (FS + PCS mechanism) ----
+
+    /// Build a member's private view of `public_tree` (a clone of the shared
+    /// public state) owned at `leaf` with `identity`'s leaf KEM secret.
+    fn member_view(public_tree: &RatchetTree, leaf: u32, identity: &MemberIdentity) -> RatchetTree {
+        let mut view = public_tree.clone();
+        view.own_leaf = None;
+        view.own_leaf_secret = None;
+        view.path_secrets.clear();
+        view.attach_owner(leaf, identity.kem_secret().unwrap().clone())
+            .unwrap();
+        view
+    }
+
+    #[test]
+    fn test_update_path_two_members_converge() {
+        let suite = CipherSuite::default();
+        let alice = MemberIdentity::generate(MemberId::generate()).unwrap();
+        let bob = MemberIdentity::generate(MemberId::generate()).unwrap();
+
+        let mut tree_a = RatchetTree::new(alice.key_package.clone(), suite).unwrap();
+        tree_a
+            .attach_owner(0, alice.kem_secret().unwrap().clone())
+            .unwrap();
+        let bob_leaf = tree_a.add_leaf(bob.key_package.clone()).unwrap();
+
+        // Bob's independent instance starts from the same public tree.
+        let mut tree_b = member_view(&tree_a, bob_leaf, &bob);
+
+        // Alice commits an UpdatePath; Bob processes it.
+        let (update_path, cs_alice) = tree_a.generate_update_path(None).unwrap();
+        let cs_bob = tree_b.process_update_path(&update_path).unwrap();
+
+        assert_eq!(
+            &*cs_alice, &*cs_bob,
+            "committer and member must reach the same commit secret"
+        );
+        assert_eq!(cs_alice.len(), suite.hash_size());
+    }
+
+    #[test]
+    fn test_update_path_three_members_converge() {
+        let suite = CipherSuite::default();
+        let alice = MemberIdentity::generate(MemberId::generate()).unwrap();
+        let bob = MemberIdentity::generate(MemberId::generate()).unwrap();
+        let carol = MemberIdentity::generate(MemberId::generate()).unwrap();
+
+        let mut tree_a = RatchetTree::new(alice.key_package.clone(), suite).unwrap();
+        tree_a
+            .attach_owner(0, alice.kem_secret().unwrap().clone())
+            .unwrap();
+        let bob_leaf = tree_a.add_leaf(bob.key_package.clone()).unwrap();
+        let carol_leaf = tree_a.add_leaf(carol.key_package.clone()).unwrap();
+
+        let mut tree_b = member_view(&tree_a, bob_leaf, &bob);
+        let mut tree_c = member_view(&tree_a, carol_leaf, &carol);
+
+        let (update_path, cs_alice) = tree_a.generate_update_path(None).unwrap();
+        let cs_bob = tree_b.process_update_path(&update_path).unwrap();
+        let cs_carol = tree_c.process_update_path(&update_path).unwrap();
+
+        assert_eq!(&*cs_alice, &*cs_bob, "Bob must converge with Alice");
+        assert_eq!(&*cs_alice, &*cs_carol, "Carol must converge with Alice");
+    }
+
+    #[test]
+    fn test_update_path_commit_secret_is_fresh() {
+        // PCS evidence: each Commit yields a fresh, independent commit secret;
+        // an attacker holding a prior epoch's secret learns nothing about the next.
+        let suite = CipherSuite::default();
+        let alice = MemberIdentity::generate(MemberId::generate()).unwrap();
+        let bob = MemberIdentity::generate(MemberId::generate()).unwrap();
+
+        let mut tree_a = RatchetTree::new(alice.key_package.clone(), suite).unwrap();
+        tree_a
+            .attach_owner(0, alice.kem_secret().unwrap().clone())
+            .unwrap();
+        let bob_leaf = tree_a.add_leaf(bob.key_package.clone()).unwrap();
+        let mut tree_b = member_view(&tree_a, bob_leaf, &bob);
+
+        let (up1, cs1) = tree_a.generate_update_path(None).unwrap();
+        tree_b.process_update_path(&up1).unwrap();
+        let (up2, cs2) = tree_a.generate_update_path(None).unwrap();
+        let cs2_b = tree_b.process_update_path(&up2).unwrap();
+
+        assert_ne!(
+            &*cs1, &*cs2,
+            "successive commits must produce distinct secrets"
+        );
+        assert_eq!(&*cs2, &*cs2_b, "still converges after a second commit");
+    }
+
+    #[test]
+    fn test_process_own_update_path_rejected() {
+        let suite = CipherSuite::default();
+        let alice = MemberIdentity::generate(MemberId::generate()).unwrap();
+        let bob = MemberIdentity::generate(MemberId::generate()).unwrap();
+        let mut tree_a = RatchetTree::new(alice.key_package.clone(), suite).unwrap();
+        tree_a
+            .attach_owner(0, alice.kem_secret().unwrap().clone())
+            .unwrap();
+        tree_a.add_leaf(bob.key_package.clone()).unwrap();
+        let (up, _cs) = tree_a.generate_update_path(None).unwrap();
+        // Alice cannot process her own UpdatePath.
+        assert!(tree_a.process_update_path(&up).is_err());
+    }
+
+    #[test]
+    fn test_deterministic_update_path_with_seed() {
+        // Same seed + same starting tree → identical commit secret (KAT-friendly).
+        let suite = CipherSuite::default();
+        let alice = MemberIdentity::generate(MemberId::generate()).unwrap();
+        let bob = MemberIdentity::generate(MemberId::generate()).unwrap();
+
+        let build = || {
+            let mut t = RatchetTree::new(alice.key_package.clone(), suite).unwrap();
+            t.attach_owner(0, alice.kem_secret().unwrap().clone())
+                .unwrap();
+            t.add_leaf(bob.key_package.clone()).unwrap();
+            t
+        };
+        let seed = [9u8; 32];
+        let (_up1, cs1) = build().generate_update_path(Some(&seed)).unwrap();
+        let (_up2, cs2) = build().generate_update_path(Some(&seed)).unwrap();
+        assert_eq!(
+            &*cs1, &*cs2,
+            "fixed seed must yield deterministic commit secret"
+        );
     }
 }
