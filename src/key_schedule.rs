@@ -392,6 +392,69 @@ impl EpochSecrets {
         )?;
         Ok((key, nonce))
     }
+
+    /// Capture this epoch's secrets as an opaque, serializable snapshot.
+    ///
+    /// **The snapshot contains raw secret key material.** The caller MUST
+    /// encrypt it at rest (mirroring [`crate::member::MemberIdentity`]'s
+    /// `#[serde(skip)]` of secret keys).
+    #[must_use]
+    pub fn snapshot(&self) -> EpochSecretsSnapshot {
+        EpochSecretsSnapshot {
+            suite: self.suite,
+            init_secret: self.init_secret.to_vec(),
+            sender_data_secret: self.sender_data_secret.to_vec(),
+            encryption_secret: self.encryption_secret.to_vec(),
+            exporter_secret: self.exporter_secret.to_vec(),
+            external_secret: self.external_secret.to_vec(),
+            confirmation_key: self.confirmation_key.to_vec(),
+            membership_key: self.membership_key.to_vec(),
+            resumption_psk: self.resumption_psk.to_vec(),
+            epoch_authenticator: self.epoch_authenticator.to_vec(),
+        }
+    }
+
+    /// Restore epoch secrets from a [`EpochSecretsSnapshot`].
+    #[must_use]
+    pub fn from_snapshot(snapshot: EpochSecretsSnapshot) -> Self {
+        Self {
+            suite: snapshot.suite,
+            init_secret: Zeroizing::new(snapshot.init_secret),
+            sender_data_secret: Zeroizing::new(snapshot.sender_data_secret),
+            encryption_secret: Zeroizing::new(snapshot.encryption_secret),
+            exporter_secret: Zeroizing::new(snapshot.exporter_secret),
+            external_secret: Zeroizing::new(snapshot.external_secret),
+            confirmation_key: Zeroizing::new(snapshot.confirmation_key),
+            membership_key: Zeroizing::new(snapshot.membership_key),
+            resumption_psk: Zeroizing::new(snapshot.resumption_psk),
+            epoch_authenticator: Zeroizing::new(snapshot.epoch_authenticator),
+        }
+    }
+}
+
+/// Serializable snapshot of [`EpochSecrets`] — **opaque secret material, must be
+/// encrypted at rest by the caller.**
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct EpochSecretsSnapshot {
+    suite: CipherSuite,
+    init_secret: Vec<u8>,
+    sender_data_secret: Vec<u8>,
+    encryption_secret: Vec<u8>,
+    exporter_secret: Vec<u8>,
+    external_secret: Vec<u8>,
+    confirmation_key: Vec<u8>,
+    membership_key: Vec<u8>,
+    resumption_psk: Vec<u8>,
+    epoch_authenticator: Vec<u8>,
+}
+
+impl std::fmt::Debug for EpochSecretsSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EpochSecretsSnapshot")
+            .field("suite", &self.suite)
+            .field("secrets", &"<redacted>")
+            .finish()
+    }
 }
 
 #[cfg(test)]

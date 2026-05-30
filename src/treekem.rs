@@ -47,6 +47,12 @@ use zeroize::Zeroize;
 /// practice. Matches the crate-wide [`crate::MAX_GROUP_SIZE`].
 pub const MAX_LEAVES: u32 = 1 << 16;
 
+/// A member's exported private tree state: `(own_leaf, own_leaf_secret_bytes,
+/// path_secret_bytes_by_node)`. **Secret material — encrypt at rest.** Returned
+/// by [`RatchetTree::secret_state`] and consumed by
+/// [`RatchetTree::restore_secret_state`].
+pub type SecretState = (Option<u32>, Option<Vec<u8>>, Vec<(u32, Vec<u8>)>);
+
 /// RFC 9420 Appendix C array-based tree math.
 ///
 /// The tree is represented as a flat array of nodes for a **perfect** binary
@@ -363,6 +369,49 @@ impl RatchetTree {
     pub fn leaf_verifying_key(&self, leaf: u32) -> Option<&[u8]> {
         self.leaf(leaf)
             .map(|data| data.key_package.verifying_key.as_slice())
+    }
+
+    /// Export this member's **private** state (owned leaf, leaf KEM secret bytes,
+    /// and per-node path secret bytes) for persistence.
+    ///
+    /// **Returns raw secret key material** — the caller MUST encrypt it at rest.
+    #[must_use]
+    pub fn secret_state(&self) -> SecretState {
+        let leaf_secret = self.own_leaf_secret.as_ref().map(|k| k.to_bytes().to_vec());
+        let path = self
+            .path_secrets
+            .iter()
+            .map(|(idx, secret)| (*idx, secret.to_vec()))
+            .collect();
+        (self.own_leaf, leaf_secret, path)
+    }
+
+    /// Restore this member's private state captured by [`Self::secret_state`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MlsError`] if the leaf KEM secret bytes are invalid for the
+    /// tree's cipher suite.
+    pub fn restore_secret_state(
+        &mut self,
+        own_leaf: Option<u32>,
+        own_leaf_secret: Option<Vec<u8>>,
+        path_secrets: Vec<(u32, Vec<u8>)>,
+    ) -> Result<()> {
+        self.own_leaf = own_leaf;
+        self.own_leaf_secret = match own_leaf_secret {
+            Some(bytes) => Some(
+                MlKemSecretKey::from_bytes(self.suite.ml_kem_variant(), &bytes).map_err(|e| {
+                    MlsError::CryptoError(format!("invalid leaf KEM secret: {e:?}"))
+                })?,
+            ),
+            None => None,
+        };
+        self.path_secrets = path_secrets
+            .into_iter()
+            .map(|(idx, secret)| (idx, zeroize::Zeroizing::new(secret)))
+            .collect();
+        Ok(())
     }
 
     /// Cipher suite this tree is pinned to.

@@ -10,29 +10,39 @@
 //! secrecy and post-compromise security:
 //!
 //! - [`TreeKemGroup::create`] starts a one-member group.
-//! - [`TreeKemGroup::add_member`] adds a member and returns a [`TreeKemWelcome`]
-//!   that conveys the public ratchet tree plus the `joiner_secret` sealed to the
-//!   new member's key package.
+//! - [`TreeKemGroup::add_member`] adds a member, returning a signed
+//!   [`TreeKemCommit`] for existing members and a [`TreeKemWelcome`] (public
+//!   ratchet tree + `joiner_secret` sealed to the new member's key package) for
+//!   the joiner.
 //! - [`TreeKemGroup::from_welcome`] reconstructs the group on the joiner's side
-//!   and lands on the *same* epoch secrets as the committer.
-//! - [`TreeKemGroup::update`] / [`TreeKemGroup::process_commit`] run an
-//!   UpdatePath commit so members heal (PCS) and advance epochs (FS).
+//!   (after verifying the committer's signature) and lands on the *same* epoch
+//!   secrets as the committer.
+//! - [`TreeKemGroup::update`] / [`TreeKemGroup::remove_member`] /
+//!   [`TreeKemGroup::process_commit`] run signed UpdatePath commits so members
+//!   heal (PCS) and advance epochs (FS); a removed member cannot derive the new
+//!   epoch.
 //! - [`TreeKemGroup::encrypt_message`] / [`TreeKemGroup::decrypt_message`]
 //!   protect application messages with per-sender/per-generation keys derived
 //!   from the epoch's `encryption_secret`, signed with the sender's identity.
+//! - [`TreeKemGroup::to_snapshot_bytes`] / [`TreeKemGroup::from_snapshot_bytes`]
+//!   persist and restore a group across process restart (secret material is
+//!   opaque and must be encrypted at rest; the long-term identity is re-supplied).
 //!
 //! This is the type intended to replace the legacy GSS [`crate::group::MlsGroup`]
 //! (ADR-002 P5/P6). It deliberately uses the post-quantum primitives only.
 //!
-//! Scope of this first cut: member **add** (via Welcome) and member **update**
-//! (UpdatePath commit). Member **remove**, full on-disk serde snapshotting,
-//! and committer-signature / parent-hash verification of commits are tracked
-//! follow-ups (see ADR-002 and the P3/P4 review notes) — message-level
-//! authentication (per-message signatures) IS enforced here.
+//! Commits and Welcomes are authenticated by the committer's signature, and
+//! application messages by the sender's signature. **Tracked follow-up:** full
+//! RFC 9420 §7.9 parent-hash verification — tree integrity is currently bound by
+//! the committer's signature over the complete UpdatePath (which determines the
+//! resulting tree), and `process_update_path` independently verifies each
+//! derived node public key; explicit parent-hash chaining is a defence-in-depth
+//! refinement. PSK injection, external commits, and reinit remain out of scope
+//! per ADR-002.
 
 use crate::{
     crypto::{AeadCipher, CipherSuite, Signature},
-    key_schedule::EpochSecrets,
+    key_schedule::{EpochSecrets, EpochSecretsSnapshot},
     member::{KeyPackage, MemberIdentity},
     treekem::{self, RatchetTree, UpdatePath},
     EpochNumber, MlsError, Result,
@@ -65,7 +75,8 @@ impl std::fmt::Debug for TreeKemGroup {
 }
 
 /// A Welcome message: the public ratchet tree plus the `joiner_secret` sealed to
-/// the new member's KEM key. Wire-serializable.
+/// the new member's KEM key, authenticated by the committer's signature.
+/// Wire-serializable.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TreeKemWelcome {
     /// Group identifier.
@@ -78,15 +89,50 @@ pub struct TreeKemWelcome {
     pub public_nodes: Vec<Option<treekem::Node>>,
     /// `joiner_secret` sealed to the new member's key package KEM key.
     pub encrypted_joiner: treekem::HpkeCiphertext,
+    /// Leaf index of the committer who produced this Welcome.
+    pub committer_leaf: u32,
+    /// Committer's signature over the Welcome contents (see `welcome_tbs`).
+    pub signature: Vec<u8>,
 }
 
-/// A commit carrying an UpdatePath (member update / rekey). Wire-serializable.
+/// A commit carrying an UpdatePath (member update / rekey / removal),
+/// authenticated by the committer's signature. Wire-serializable.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TreeKemCommit {
     /// Epoch this commit produces.
     pub epoch: EpochNumber,
+    /// Leaf index of the committer.
+    pub committer_leaf: u32,
+    /// Members added by this commit, as `(leaf index, key package)`. Existing
+    /// members install these leaves (at the stated indices) before processing
+    /// the path; the added members themselves receive a separate Welcome.
+    pub added: Vec<(u32, KeyPackage)>,
+    /// Leaves removed by this commit (blanked before the committer's path is
+    /// processed), if any.
+    pub removed_leaves: Vec<u32>,
     /// The UpdatePath rotating the committer's direct path.
     pub update_path: UpdatePath,
+    /// Committer's signature over the commit contents (see `commit_tbs`).
+    pub signature: Vec<u8>,
+}
+
+/// A full persistence snapshot of a [`TreeKemGroup`] (minus the long-term member
+/// identity, which the caller re-supplies on restore).
+///
+/// **Contains raw secret key material** (leaf KEM secret, path secrets, epoch
+/// secrets). The caller MUST encrypt this at rest — mirroring how
+/// [`crate::member::MemberIdentity`] keeps secret keys `#[serde(skip)]`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TreeKemGroupSnapshot {
+    suite: CipherSuite,
+    group_id: Vec<u8>,
+    epoch: EpochNumber,
+    public_nodes: Vec<Option<treekem::Node>>,
+    own_leaf: Option<u32>,
+    own_leaf_secret: Option<Vec<u8>>,
+    path_secrets: Vec<(u32, Vec<u8>)>,
+    epoch_secrets: EpochSecretsSnapshot,
+    send_generation: u32,
 }
 
 /// An encrypted application message. Wire-serializable.
@@ -140,34 +186,61 @@ impl TreeKemGroup {
         })
     }
 
-    /// Add a new member, returning a [`TreeKemWelcome`] for them. The caller
-    /// (committer) advances to the next epoch; existing members other than the
-    /// joiner would process the embedded UpdatePath via a separate Commit (the
-    /// joiner uses the sealed `joiner_secret` and does not process the path).
+    /// Add a new member. Returns a signed [`TreeKemCommit`] that existing
+    /// members process (they install the new leaf, then the committer's
+    /// UpdatePath) and a [`TreeKemWelcome`] for the new member (who reconstructs
+    /// the epoch from the sealed `joiner_secret`). The committer advances to the
+    /// next epoch.
     ///
     /// # Errors
     ///
     /// Returns [`MlsError`] on crypto/tree failure or if the new member's suite
     /// mismatches.
-    pub fn add_member(&mut self, new_member: &KeyPackage) -> Result<TreeKemWelcome> {
+    pub fn add_member(
+        &mut self,
+        new_member: &KeyPackage,
+    ) -> Result<(TreeKemCommit, TreeKemWelcome)> {
         if new_member.cipher_suite != self.suite {
             return Err(MlsError::InvalidGroupState(
                 "new member cipher suite mismatch".into(),
             ));
         }
-        self.tree.add_leaf(new_member.clone())?;
+        let new_leaf = self.tree.add_leaf(new_member.clone())?;
+        let committer_leaf = self
+            .tree
+            .own_leaf()
+            .ok_or_else(|| MlsError::InvalidGroupState("committer owns no leaf".into()))?;
 
         // UpdatePath rooted at the committer; bound to the current (pre-commit)
         // group + epoch as AAD so existing members decrypt under a shared context.
         let path_aad = Self::path_context(&self.group_id, self.epoch);
         let (update_path, commit_secret) = self.tree.generate_update_path(&path_aad, None)?;
-        let _ = update_path; // existing members consume this via process_commit; the
-                             // joiner below reconstructs the epoch from joiner_secret.
 
         let new_epoch = self.epoch + 1;
+        let added = vec![(new_leaf, new_member.clone())];
+
+        // Commit for existing members (they add the leaf, then process the path).
+        let commit_tbs = Self::commit_tbs(
+            &self.group_id,
+            new_epoch,
+            committer_leaf,
+            &added,
+            &[],
+            &update_path,
+        )?;
+        let commit_signature = self.identity.sign(&commit_tbs)?.to_bytes();
+        let commit = TreeKemCommit {
+            epoch: new_epoch,
+            committer_leaf,
+            added,
+            removed_leaves: Vec::new(),
+            update_path,
+            signature: commit_signature,
+        };
+
+        // Welcome for the new member (reconstructs the epoch from joiner_secret).
         let new_tree_hash = self.tree.tree_hash()?;
         let new_ctx = Self::group_context(&self.group_id, new_epoch, &new_tree_hash);
-
         let joiner = EpochSecrets::joiner_secret(
             self.suite,
             self.epoch_secrets.init_secret(),
@@ -175,23 +248,27 @@ impl TreeKemGroup {
         )?;
         let new_epoch_secrets = EpochSecrets::from_joiner(self.suite, &joiner, &new_ctx)?;
 
-        // Seal joiner_secret to the new member's KEM key, bound to the new epoch.
         let seal_aad = Self::path_context(&self.group_id, new_epoch);
         let encrypted_joiner =
             treekem::seal_to(self.suite, &new_member.agreement_key, &joiner, &seal_aad)?;
-
+        let public_nodes = self.tree.export_public_nodes();
+        let welcome_tbs =
+            Self::welcome_tbs(&self.group_id, new_epoch, committer_leaf, &public_nodes)?;
+        let welcome_signature = self.identity.sign(&welcome_tbs)?.to_bytes();
         let welcome = TreeKemWelcome {
             group_id: self.group_id.clone(),
             epoch: new_epoch,
             cipher_suite: self.suite,
-            public_nodes: self.tree.export_public_nodes(),
+            public_nodes,
             encrypted_joiner,
+            committer_leaf,
+            signature: welcome_signature,
         };
 
         self.epoch_secrets = new_epoch_secrets;
         self.epoch = new_epoch;
         self.send_generation = 0;
-        Ok(welcome)
+        Ok((commit, welcome))
     }
 
     /// Join a group from a [`TreeKemWelcome`], landing on the same epoch secrets
@@ -208,7 +285,28 @@ impl TreeKemGroup {
                 "identity cipher suite does not match welcome".into(),
             ));
         }
-        let mut tree = RatchetTree::from_public_nodes(suite, welcome.public_nodes.clone());
+        let tree = RatchetTree::from_public_nodes(suite, welcome.public_nodes.clone());
+
+        // Authenticate the Welcome: the committer (a tree member) must have
+        // signed it. Verify before trusting any of the conveyed tree state.
+        let committer_kp = tree
+            .leaf(welcome.committer_leaf)
+            .map(|l| &l.key_package)
+            .ok_or_else(|| MlsError::InvalidMessage("welcome committer leaf is blank".into()))?;
+        let tbs = Self::welcome_tbs(
+            &welcome.group_id,
+            welcome.epoch,
+            welcome.committer_leaf,
+            &welcome.public_nodes,
+        )?;
+        let sig = Self::reconstruct_signature_for(suite, &welcome.signature)?;
+        if !committer_kp.verify_signature(&tbs, &sig)? {
+            return Err(MlsError::InvalidMessage(
+                "invalid welcome committer signature".into(),
+            ));
+        }
+
+        let mut tree = tree;
         let my_leaf = tree.find_leaf(&identity.key_package).ok_or_else(|| {
             MlsError::InvalidGroupState("own key package not found in welcome tree".into())
         })?;
@@ -241,33 +339,83 @@ impl TreeKemGroup {
     }
 
     /// Commit a self-update (rekey): rotate this member's direct path and
-    /// advance the epoch. Returns the [`TreeKemCommit`] other members process.
+    /// advance the epoch. Returns the signed [`TreeKemCommit`] other members
+    /// process.
     ///
     /// # Errors
     ///
     /// Returns [`MlsError`] on crypto/tree failure.
     pub fn update(&mut self) -> Result<TreeKemCommit> {
+        self.make_commit(Vec::new())
+    }
+
+    /// Remove the member at `leaf`: blank their leaf and direct path, then
+    /// commit a fresh UpdatePath so the removed member cannot derive the new
+    /// epoch (forward secrecy on removal). Returns the signed [`TreeKemCommit`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MlsError`] if `leaf` is this member, is blank/out of range, or
+    /// on crypto/tree failure.
+    pub fn remove_member(&mut self, leaf: u32) -> Result<TreeKemCommit> {
+        if self.tree.own_leaf() == Some(leaf) {
+            return Err(MlsError::InvalidGroupState(
+                "cannot remove self via remove_member".into(),
+            ));
+        }
+        if self.tree.leaf(leaf).is_none() {
+            return Err(MlsError::MemberNotFound(crate::member::MemberId::generate()));
+        }
+        self.make_commit(vec![leaf])
+    }
+
+    /// Build, apply, and sign a commit that optionally removes `removed_leaves`
+    /// and rotates the committer's direct path.
+    fn make_commit(&mut self, removed_leaves: Vec<u32>) -> Result<TreeKemCommit> {
+        for &leaf in &removed_leaves {
+            self.tree.blank_leaf(leaf)?;
+        }
+        let committer_leaf = self
+            .tree
+            .own_leaf()
+            .ok_or_else(|| MlsError::InvalidGroupState("committer owns no leaf".into()))?;
         let path_aad = Self::path_context(&self.group_id, self.epoch);
         let (update_path, commit_secret) = self.tree.generate_update_path(&path_aad, None)?;
 
         let new_epoch = self.epoch + 1;
+        let tbs = Self::commit_tbs(
+            &self.group_id,
+            new_epoch,
+            committer_leaf,
+            &[],
+            &removed_leaves,
+            &update_path,
+        )?;
+        let signature = self.identity.sign(&tbs)?.to_bytes();
+
         let new_ctx = Self::group_context(&self.group_id, new_epoch, &self.tree.tree_hash()?);
         self.epoch_secrets = self.epoch_secrets.next(&commit_secret, &new_ctx)?;
         self.epoch = new_epoch;
         self.send_generation = 0;
         Ok(TreeKemCommit {
             epoch: new_epoch,
+            committer_leaf,
+            added: Vec::new(),
+            removed_leaves,
             update_path,
+            signature,
         })
     }
 
     /// Process another member's [`TreeKemCommit`], advancing to the same epoch
-    /// secrets as the committer.
+    /// secrets as the committer. The committer's signature is verified before
+    /// any tree state is mutated.
     ///
     /// # Errors
     ///
-    /// Returns [`MlsError`] if the commit's epoch is unexpected or on
-    /// crypto/tree failure.
+    /// Returns [`MlsError`] if the commit's epoch is unexpected, the committer
+    /// signature is invalid, this member was the one removed, or on crypto/tree
+    /// failure.
     pub fn process_commit(&mut self, commit: &TreeKemCommit) -> Result<()> {
         let new_epoch = self.epoch + 1;
         if commit.epoch != new_epoch {
@@ -275,6 +423,56 @@ impl TreeKemGroup {
                 expected: new_epoch,
                 actual: commit.epoch,
             });
+        }
+        if commit.removed_leaves.contains(&commit.committer_leaf) {
+            return Err(MlsError::InvalidMessage(
+                "commit cannot remove its own committer".into(),
+            ));
+        }
+
+        // Authenticate the committer before touching any state.
+        let tbs = Self::commit_tbs(
+            &self.group_id,
+            new_epoch,
+            commit.committer_leaf,
+            &commit.added,
+            &commit.removed_leaves,
+            &commit.update_path,
+        )?;
+        let sig = Self::reconstruct_signature_for(self.suite, &commit.signature)?;
+        {
+            let committer_kp = self
+                .tree
+                .leaf(commit.committer_leaf)
+                .map(|l| &l.key_package)
+                .ok_or_else(|| MlsError::InvalidMessage("commit committer leaf is blank".into()))?;
+            if !committer_kp.verify_signature(&tbs, &sig)? {
+                return Err(MlsError::InvalidMessage(
+                    "invalid commit committer signature".into(),
+                ));
+            }
+        }
+        let my_leaf = self
+            .tree
+            .own_leaf()
+            .ok_or_else(|| MlsError::InvalidGroupState("instance owns no leaf".into()))?;
+        if commit.removed_leaves.contains(&my_leaf) {
+            return Err(MlsError::InvalidGroupState(
+                "this member was removed by the commit".into(),
+            ));
+        }
+
+        // Install added members at the committer-stated leaf indices.
+        for (leaf, key_package) in &commit.added {
+            let assigned = self.tree.add_leaf(key_package.clone())?;
+            if assigned != *leaf {
+                return Err(MlsError::InvalidGroupState(format!(
+                    "added member landed at leaf {assigned}, commit expected {leaf} (tree desync)"
+                )));
+            }
+        }
+        for &leaf in &commit.removed_leaves {
+            self.tree.blank_leaf(leaf)?;
         }
         let path_aad = Self::path_context(&self.group_id, self.epoch);
         let commit_secret = self
@@ -361,6 +559,88 @@ impl TreeKemGroup {
         self.epoch_secrets.export(label, context, length)
     }
 
+    /// Capture a full persistence [`TreeKemGroupSnapshot`] (survives process
+    /// restart). **Contains secret material — encrypt at rest.**
+    #[must_use]
+    pub fn to_snapshot(&self) -> TreeKemGroupSnapshot {
+        let (own_leaf, own_leaf_secret, path_secrets) = self.tree.secret_state();
+        TreeKemGroupSnapshot {
+            suite: self.suite,
+            group_id: self.group_id.clone(),
+            epoch: self.epoch,
+            public_nodes: self.tree.export_public_nodes(),
+            own_leaf,
+            own_leaf_secret,
+            path_secrets,
+            epoch_secrets: self.epoch_secrets.snapshot(),
+            send_generation: self.send_generation,
+        }
+    }
+
+    /// Serialize a snapshot to opaque bytes. **Encrypt at rest.**
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MlsError`] on serialization failure.
+    pub fn to_snapshot_bytes(&self) -> Result<Vec<u8>> {
+        postcard::to_stdvec(&self.to_snapshot())
+            .map_err(|e| MlsError::SerializationError(e.to_string()))
+    }
+
+    /// Restore a group from a snapshot, re-supplying the member's long-term
+    /// identity (kept in the caller's keystore, not in the snapshot).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MlsError`] if the suite mismatches, the snapshot's owner leaf
+    /// does not match `identity`, or the leaf KEM secret is invalid.
+    pub fn from_snapshot(snapshot: TreeKemGroupSnapshot, identity: MemberIdentity) -> Result<Self> {
+        let suite = snapshot.suite;
+        if identity.cipher_suite() != suite {
+            return Err(MlsError::InvalidGroupState(
+                "identity cipher suite does not match snapshot".into(),
+            ));
+        }
+        let mut tree = RatchetTree::from_public_nodes(suite, snapshot.public_nodes);
+        tree.restore_secret_state(
+            snapshot.own_leaf,
+            snapshot.own_leaf_secret,
+            snapshot.path_secrets,
+        )?;
+        // The restored owner leaf must carry this identity's key package.
+        let owner_ok = snapshot.own_leaf.is_some_and(|leaf| {
+            tree.leaf(leaf)
+                .is_some_and(|l| l.key_package == identity.key_package)
+        });
+        if !owner_ok {
+            return Err(MlsError::InvalidGroupState(
+                "identity does not match the snapshot's owner leaf".into(),
+            ));
+        }
+        let epoch_secrets = EpochSecrets::from_snapshot(snapshot.epoch_secrets);
+        Ok(Self {
+            suite,
+            group_id: snapshot.group_id,
+            epoch: snapshot.epoch,
+            identity,
+            tree,
+            epoch_secrets,
+            send_generation: snapshot.send_generation,
+        })
+    }
+
+    /// Restore a group from snapshot bytes produced by [`Self::to_snapshot_bytes`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MlsError`] on deserialization failure or snapshot/identity
+    /// mismatch.
+    pub fn from_snapshot_bytes(bytes: &[u8], identity: MemberIdentity) -> Result<Self> {
+        let snapshot: TreeKemGroupSnapshot = postcard::from_bytes(bytes)
+            .map_err(|e| MlsError::DeserializationError(e.to_string()))?;
+        Self::from_snapshot(snapshot, identity)
+    }
+
     /// Current epoch.
     #[must_use]
     pub fn epoch(&self) -> EpochNumber {
@@ -386,15 +666,68 @@ impl TreeKemGroup {
     }
 
     fn reconstruct_signature(&self, bytes: &[u8]) -> Result<Signature> {
-        if self.suite.uses_slh_dsa() {
-            let sig = SlhDsaSignature::from_bytes(self.suite.slh_dsa_variant(), bytes)
+        Self::reconstruct_signature_for(self.suite, bytes)
+    }
+
+    fn reconstruct_signature_for(suite: CipherSuite, bytes: &[u8]) -> Result<Signature> {
+        if suite.uses_slh_dsa() {
+            let sig = SlhDsaSignature::from_bytes(suite.slh_dsa_variant(), bytes)
                 .map_err(|e| MlsError::CryptoError(format!("invalid SLH-DSA signature: {e:?}")))?;
             Ok(Signature::SlhDsa(sig))
         } else {
-            let sig = MlDsaSignature::from_bytes(self.suite.ml_dsa_variant(), bytes)
+            let sig = MlDsaSignature::from_bytes(suite.ml_dsa_variant(), bytes)
                 .map_err(|e| MlsError::CryptoError(format!("invalid ML-DSA signature: {e:?}")))?;
             Ok(Signature::MlDsa(sig))
         }
+    }
+
+    /// Bytes signed by the committer for a [`TreeKemCommit`]: a domain-separated,
+    /// length-prefixed encoding of group id, new epoch, committer leaf, removed
+    /// leaves, and the full UpdatePath (which determines the resulting tree).
+    fn commit_tbs(
+        group_id: &[u8],
+        new_epoch: EpochNumber,
+        committer_leaf: u32,
+        added: &[(u32, KeyPackage)],
+        removed_leaves: &[u32],
+        update_path: &UpdatePath,
+    ) -> Result<Vec<u8>> {
+        let mut tbs = Vec::new();
+        tbs.extend_from_slice(b"saorsa-mls TreeKemCommit v1");
+        push_field(&mut tbs, group_id);
+        tbs.extend_from_slice(&new_epoch.to_be_bytes());
+        tbs.extend_from_slice(&committer_leaf.to_be_bytes());
+        let added_bytes = postcard::to_stdvec(&added.to_vec())
+            .map_err(|e| MlsError::SerializationError(e.to_string()))?;
+        push_field(&mut tbs, &added_bytes);
+        let removed_bytes: Vec<u8> = removed_leaves
+            .iter()
+            .flat_map(|l| l.to_be_bytes())
+            .collect();
+        push_field(&mut tbs, &removed_bytes);
+        let path_bytes = postcard::to_stdvec(update_path)
+            .map_err(|e| MlsError::SerializationError(e.to_string()))?;
+        push_field(&mut tbs, &path_bytes);
+        Ok(tbs)
+    }
+
+    /// Bytes signed by the committer for a [`TreeKemWelcome`]: group id, epoch,
+    /// committer leaf, and the public ratchet tree.
+    fn welcome_tbs(
+        group_id: &[u8],
+        epoch: EpochNumber,
+        committer_leaf: u32,
+        public_nodes: &[Option<treekem::Node>],
+    ) -> Result<Vec<u8>> {
+        let mut tbs = Vec::new();
+        tbs.extend_from_slice(b"saorsa-mls TreeKemWelcome v1");
+        push_field(&mut tbs, group_id);
+        tbs.extend_from_slice(&epoch.to_be_bytes());
+        tbs.extend_from_slice(&committer_leaf.to_be_bytes());
+        let nodes_bytes = postcard::to_stdvec(public_nodes)
+            .map_err(|e| MlsError::SerializationError(e.to_string()))?;
+        push_field(&mut tbs, &nodes_bytes);
+        Ok(tbs)
     }
 
     /// Group context for the key schedule: `group_id ‖ epoch ‖ tree_hash`.
@@ -423,6 +756,14 @@ impl TreeKemGroup {
         aad.extend_from_slice(&generation.to_be_bytes());
         aad
     }
+}
+
+/// Append `data` to `buf` with a 4-byte big-endian length prefix, so the
+/// signed-content encoding is unambiguous.
+fn push_field(buf: &mut Vec<u8>, data: &[u8]) {
+    let len = u32::try_from(data.len()).unwrap_or(u32::MAX);
+    buf.extend_from_slice(&len.to_be_bytes());
+    buf.extend_from_slice(data);
 }
 
 #[cfg(test)]
@@ -455,7 +796,7 @@ mod tests {
         let bob = identity(suite);
 
         let mut alice_group = TreeKemGroup::create(b"room".to_vec(), alice).unwrap();
-        let welcome = alice_group.add_member(&bob.key_package).unwrap();
+        let (_commit, welcome) = alice_group.add_member(&bob.key_package).unwrap();
         let mut bob_group = TreeKemGroup::from_welcome(&welcome, bob).unwrap();
 
         assert_eq!(alice_group.epoch(), bob_group.epoch());
@@ -484,7 +825,7 @@ mod tests {
         let alice = identity(suite);
         let bob = identity(suite);
         let mut alice_group = TreeKemGroup::create(b"room".to_vec(), alice).unwrap();
-        let welcome = alice_group.add_member(&bob.key_package).unwrap();
+        let (_commit, welcome) = alice_group.add_member(&bob.key_package).unwrap();
         let mut bob_group = TreeKemGroup::from_welcome(&welcome, bob).unwrap();
 
         let epoch1_export = alice_group.export_secret("x", b"", 32).unwrap();
@@ -516,7 +857,7 @@ mod tests {
         let alice = identity(suite);
         let bob = identity(suite);
         let mut alice_group = TreeKemGroup::create(b"room".to_vec(), alice).unwrap();
-        let welcome = alice_group.add_member(&bob.key_package).unwrap();
+        let (_commit, welcome) = alice_group.add_member(&bob.key_package).unwrap();
         let mut bob_group = TreeKemGroup::from_welcome(&welcome, bob).unwrap();
 
         let ct = alice_group.encrypt_message(b"x").unwrap();
@@ -534,7 +875,7 @@ mod tests {
         let alice = identity(suite);
         let bob = identity(suite);
         let mut alice_group = TreeKemGroup::create(b"room".to_vec(), alice).unwrap();
-        let welcome = alice_group.add_member(&bob.key_package).unwrap();
+        let (_commit, welcome) = alice_group.add_member(&bob.key_package).unwrap();
         let bob_group = TreeKemGroup::from_welcome(&welcome, bob).unwrap();
 
         let mut ct = alice_group.encrypt_message(b"secret").unwrap();
@@ -542,5 +883,168 @@ mod tests {
         let idx = ct.ciphertext.len() - 1;
         ct.ciphertext[idx] ^= 0xFF;
         assert!(bob_group.decrypt_message(&ct).is_err());
+    }
+
+    #[test]
+    fn test_three_members_converge_via_commit() {
+        // Alice adds Bob, then adds Carol; existing member Bob processes the
+        // second commit while Carol joins via Welcome. All three land on the
+        // same epoch and exchange messages.
+        let suite = CipherSuite::default();
+        let alice = identity(suite);
+        let bob = identity(suite);
+        let carol = identity(suite);
+
+        let mut alice_group = TreeKemGroup::create(b"room".to_vec(), alice).unwrap();
+        let (_c1, w1) = alice_group.add_member(&bob.key_package).unwrap();
+        let mut bob_group = TreeKemGroup::from_welcome(&w1, bob).unwrap();
+
+        let (c2, w2) = alice_group.add_member(&carol.key_package).unwrap();
+        bob_group.process_commit(&c2).unwrap();
+        let mut carol_group = TreeKemGroup::from_welcome(&w2, carol).unwrap();
+
+        assert_eq!(alice_group.epoch(), 2);
+        assert_eq!(bob_group.epoch(), 2);
+        assert_eq!(carol_group.epoch(), 2);
+        assert_eq!(alice_group.member_count(), 3);
+
+        // Carol -> {Alice, Bob}
+        let ct = carol_group.encrypt_message(b"hello all").unwrap();
+        assert_eq!(alice_group.decrypt_message(&ct).unwrap(), b"hello all");
+        assert_eq!(bob_group.decrypt_message(&ct).unwrap(), b"hello all");
+
+        // exporters agree across all three
+        let ea = alice_group.export_secret("x", b"", 32).unwrap();
+        assert_eq!(ea, bob_group.export_secret("x", b"", 32).unwrap());
+        assert_eq!(ea, carol_group.export_secret("x", b"", 32).unwrap());
+    }
+
+    #[test]
+    fn test_forged_welcome_signature_rejected() {
+        let suite = CipherSuite::default();
+        let alice = identity(suite);
+        let bob = identity(suite);
+        let mut alice_group = TreeKemGroup::create(b"room".to_vec(), alice).unwrap();
+        let (_c, mut welcome) = alice_group.add_member(&bob.key_package).unwrap();
+        welcome.signature[0] ^= 0xFF;
+        assert!(TreeKemGroup::from_welcome(&welcome, bob).is_err());
+    }
+
+    #[test]
+    fn test_forged_commit_signature_rejected() {
+        let suite = CipherSuite::default();
+        let alice = identity(suite);
+        let bob = identity(suite);
+        let mut alice_group = TreeKemGroup::create(b"room".to_vec(), alice).unwrap();
+        let (_c, w) = alice_group.add_member(&bob.key_package).unwrap();
+        let mut bob_group = TreeKemGroup::from_welcome(&w, bob).unwrap();
+
+        let mut commit = alice_group.update().unwrap();
+        commit.signature[0] ^= 0xFF;
+        assert!(bob_group.process_commit(&commit).is_err());
+        // bob's epoch must be unchanged after a rejected commit
+        assert_eq!(bob_group.epoch(), 1);
+    }
+
+    #[test]
+    fn test_remove_member_forward_secrecy() {
+        let suite = CipherSuite::default();
+        let alice = identity(suite);
+        let bob = identity(suite);
+        let mut alice_group = TreeKemGroup::create(b"room".to_vec(), alice).unwrap();
+        let (_c, w) = alice_group.add_member(&bob.key_package).unwrap();
+        let mut bob_group = TreeKemGroup::from_welcome(&w, bob).unwrap();
+        let bob_leaf = bob_group.own_leaf().unwrap();
+
+        // Alice removes Bob and commits a fresh path.
+        let commit = alice_group.remove_member(bob_leaf).unwrap();
+        assert_eq!(alice_group.epoch(), 2);
+        assert_eq!(alice_group.member_count(), 1);
+
+        // Bob cannot process a commit that removed him.
+        assert!(bob_group.process_commit(&commit).is_err());
+        assert_eq!(
+            bob_group.epoch(),
+            1,
+            "removed member stays at the old epoch"
+        );
+
+        // Alice (solo) still operates at the new epoch; Bob's stale epoch-1 keys
+        // cannot decrypt it.
+        let ct = alice_group.encrypt_message(b"after removal").unwrap();
+        assert!(matches!(
+            bob_group.decrypt_message(&ct),
+            Err(MlsError::InvalidEpoch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_snapshot_restore_roundtrip() {
+        // A serialized group restores to a functionally identical group (the
+        // member re-supplies their long-term identity).
+        let suite = CipherSuite::default();
+        let alice = identity(suite);
+        let bob = identity(suite);
+        let mut alice_group = TreeKemGroup::create(b"room".to_vec(), alice).unwrap();
+        let (_c, w) = alice_group.add_member(&bob.key_package).unwrap();
+        let bob_group = TreeKemGroup::from_welcome(&w, bob.clone()).unwrap();
+
+        // Snapshot Bob, then restore from the opaque bytes.
+        let snapshot = bob_group.to_snapshot_bytes().unwrap();
+        let mut restored = TreeKemGroup::from_snapshot_bytes(&snapshot, bob).unwrap();
+        assert_eq!(restored.epoch(), bob_group.epoch());
+        assert_eq!(restored.own_leaf(), bob_group.own_leaf());
+
+        // The restored group still decrypts Alice's messages...
+        let ct = alice_group.encrypt_message(b"to restored bob").unwrap();
+        assert_eq!(restored.decrypt_message(&ct).unwrap(), b"to restored bob");
+        // ...and Alice decrypts the restored group's messages.
+        let ct = restored.encrypt_message(b"from restored bob").unwrap();
+        assert_eq!(
+            alice_group.decrypt_message(&ct).unwrap(),
+            b"from restored bob"
+        );
+        // exporter agreement confirms identical epoch secrets
+        assert_eq!(
+            restored.export_secret("x", b"", 32).unwrap(),
+            alice_group.export_secret("x", b"", 32).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_snapshot_rejects_wrong_identity() {
+        let suite = CipherSuite::default();
+        let alice = identity(suite);
+        let bob = identity(suite);
+        let eve = identity(suite);
+        let mut alice_group = TreeKemGroup::create(b"room".to_vec(), alice).unwrap();
+        let (_c, w) = alice_group.add_member(&bob.key_package).unwrap();
+        let bob_group = TreeKemGroup::from_welcome(&w, bob).unwrap();
+        let snapshot = bob_group.to_snapshot_bytes().unwrap();
+        // Eve cannot adopt Bob's snapshot.
+        assert!(TreeKemGroup::from_snapshot_bytes(&snapshot, eve).is_err());
+    }
+
+    #[test]
+    fn test_wire_serialized_welcome_and_message() {
+        // Cross-"process": everything crosses the wire as postcard bytes. Bob
+        // joins from serialized Welcome bytes and decrypts a serialized message.
+        let suite = CipherSuite::default();
+        let alice = identity(suite);
+        let bob = identity(suite);
+        let mut alice_group = TreeKemGroup::create(b"room".to_vec(), alice).unwrap();
+        let (_commit, welcome) = alice_group.add_member(&bob.key_package).unwrap();
+
+        let welcome_bytes = postcard::to_stdvec(&welcome).unwrap();
+        let welcome_wire: TreeKemWelcome = postcard::from_bytes(&welcome_bytes).unwrap();
+        let bob_group = TreeKemGroup::from_welcome(&welcome_wire, bob).unwrap();
+
+        let ct = alice_group.encrypt_message(b"over the wire").unwrap();
+        let ct_bytes = postcard::to_stdvec(&ct).unwrap();
+        let ct_wire: ApplicationCiphertext = postcard::from_bytes(&ct_bytes).unwrap();
+        assert_eq!(
+            bob_group.decrypt_message(&ct_wire).unwrap(),
+            b"over the wire"
+        );
     }
 }
