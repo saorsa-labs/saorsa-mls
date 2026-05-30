@@ -225,14 +225,49 @@ impl EpochSecrets {
         commit_secret: &[u8],
         group_context: &[u8],
     ) -> Result<Self> {
-        // joiner_secret = Extract(init_secret[n-1], commit_secret)
-        let joiner = Zeroizing::new(extract(suite, prev_init_secret, commit_secret)?);
+        let joiner = Self::joiner_secret(suite, prev_init_secret, commit_secret)?;
+        Self::from_joiner(suite, &joiner, group_context)
+    }
+
+    /// `joiner_secret = Extract(init_secret[n-1], commit_secret)`.
+    ///
+    /// This is the value a Welcome message seals to a newly added member so the
+    /// joiner can reconstruct the epoch without learning prior epochs' secrets.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MlsError`] on HMAC failure.
+    pub fn joiner_secret(
+        suite: CipherSuite,
+        prev_init_secret: &[u8],
+        commit_secret: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        Ok(Zeroizing::new(extract(
+            suite,
+            prev_init_secret,
+            commit_secret,
+        )?))
+    }
+
+    /// Derive the epoch secrets from a `joiner_secret` and the group context.
+    /// Both the committer (after computing the joiner from init+commit) and a
+    /// newly added member (who receives the joiner via Welcome) call this and
+    /// arrive at the identical epoch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MlsError`] if any HKDF step fails.
+    pub fn from_joiner(
+        suite: CipherSuite,
+        joiner_secret: &[u8],
+        group_context: &[u8],
+    ) -> Result<Self> {
         // epoch_secret = ExpandWithLabel(joiner_secret, "epoch", group_context, Nh)
         // (psk_secret is implicitly zero — PSK is out of scope)
         let nh = KdfFamily::for_suite(suite).nh();
         let epoch_secret = Zeroizing::new(expand_with_label(
             suite,
-            &joiner,
+            joiner_secret,
             "epoch",
             group_context,
             nh,
@@ -324,6 +359,38 @@ impl EpochSecrets {
         let derived = derive_secret(self.suite, &self.exporter_secret, label)?;
         let context_hash = Hash::new(self.suite).hash(context);
         expand_with_label(self.suite, &derived, "exported", &context_hash, length)
+    }
+
+    /// Derive the per-sender AEAD key and base nonce for an application message
+    /// from this epoch's `encryption_secret`, bound to the sender's leaf index
+    /// and a per-sender `generation` counter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MlsError`] on HKDF failure.
+    pub fn application_key_and_nonce(
+        &self,
+        sender_leaf: u32,
+        generation: u32,
+    ) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>)> {
+        let mut context = Vec::with_capacity(8);
+        context.extend_from_slice(&sender_leaf.to_be_bytes());
+        context.extend_from_slice(&generation.to_be_bytes());
+        let key = Zeroizing::new(expand_with_label(
+            self.suite,
+            &self.encryption_secret,
+            "key",
+            &context,
+            self.suite.key_size(),
+        )?);
+        let nonce = expand_with_label(
+            self.suite,
+            &self.encryption_secret,
+            "nonce",
+            &context,
+            self.suite.nonce_size(),
+        )?;
+        Ok((key, nonce))
     }
 }
 

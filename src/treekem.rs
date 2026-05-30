@@ -213,8 +213,9 @@ pub mod treemath {
     }
 }
 
-/// A node in the ratchet tree.
-#[derive(Clone, Debug)]
+/// A node in the ratchet tree. Holds only **public** material, so it is safe to
+/// serialize and ship in a Welcome / ratchet-tree extension.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Node {
     /// A leaf node bound to a member's key package.
     Leaf(LeafNodeData),
@@ -223,7 +224,7 @@ pub enum Node {
 }
 
 /// Public data carried by a leaf node.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LeafNodeData {
     /// ML-KEM public key bytes for this leaf (equals
     /// `key_package.agreement_key`).
@@ -233,7 +234,7 @@ pub struct LeafNodeData {
 }
 
 /// Public data carried by an intermediate (parent) node.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ParentNodeData {
     /// ML-KEM public key bytes for this node (derived during an UpdatePath).
     pub encryption_key: Vec<u8>,
@@ -326,6 +327,42 @@ impl RatchetTree {
     #[must_use]
     pub fn own_leaf(&self) -> Option<u32> {
         self.own_leaf
+    }
+
+    /// Export the public node array (no private material) for shipping in a
+    /// Welcome or ratchet-tree extension.
+    #[must_use]
+    pub fn export_public_nodes(&self) -> Vec<Option<Node>> {
+        self.nodes.clone()
+    }
+
+    /// Reconstruct a public-only tree (no owner, no secrets) from an exported
+    /// node array — the joiner's starting point before [`Self::attach_owner`].
+    #[must_use]
+    pub fn from_public_nodes(suite: CipherSuite, nodes: Vec<Option<Node>>) -> Self {
+        Self {
+            suite,
+            nodes,
+            own_leaf: None,
+            own_leaf_secret: None,
+            path_secrets: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Find the leaf index whose key package equals `key_package`, if any.
+    #[must_use]
+    pub fn find_leaf(&self, key_package: &KeyPackage) -> Option<u32> {
+        (0..self.leaf_capacity()).find(|&leaf| {
+            self.leaf(leaf)
+                .is_some_and(|data| &data.key_package == key_package)
+        })
+    }
+
+    /// The signature verifying key bytes for the member at `leaf`, if present.
+    #[must_use]
+    pub fn leaf_verifying_key(&self, leaf: u32) -> Option<&[u8]> {
+        self.leaf(leaf)
+            .map(|data| data.key_package.verifying_key.as_slice())
     }
 
     /// Cipher suite this tree is pinned to.
@@ -901,7 +938,7 @@ fn path_aead(suite: CipherSuite, shared_secret: &[u8]) -> Result<(AeadCipher, Ve
 /// HKDF the shared secret into a key/nonce and AEAD-seal. `aad` binds the
 /// ciphertext to a group context (the caller passes group id + epoch so a sealed
 /// path secret cannot be replayed into another group or epoch).
-fn seal_to(
+pub(crate) fn seal_to(
     suite: CipherSuite,
     recipient_pub: &[u8],
     plaintext: &[u8],
@@ -922,7 +959,7 @@ fn seal_to(
 }
 
 /// Inverse of [`seal_to`]: decapsulate with `my_sk` and AEAD-open under `aad`.
-fn open_from(
+pub(crate) fn open_from(
     suite: CipherSuite,
     my_sk: &MlKemSecretKey,
     hc: &HpkeCiphertext,
