@@ -199,6 +199,10 @@ impl CipherSuite {
 
     /// Get ML-DSA variant (panics if using SLH-DSA - check uses_slh_dsa() first)
     #[must_use]
+    // Intentional misuse guard: documented precondition (`uses_slh_dsa()` false).
+    // Every internal caller gates on `uses_slh_dsa()`, so this arm is
+    // unreachable; a `Result` here would ripple across 20+ infallible callers.
+    #[allow(clippy::panic)]
     pub fn ml_dsa_variant(&self) -> MlDsaVariant {
         match self.signature {
             MlsSignature::MlDsa44 => MlDsaVariant::MlDsa44,
@@ -212,6 +216,9 @@ impl CipherSuite {
 
     /// Get SLH-DSA variant (panics if using ML-DSA - check uses_slh_dsa() first)
     #[must_use]
+    // Intentional misuse guard (see `ml_dsa_variant`): unreachable for all
+    // internal callers, which gate on `uses_slh_dsa()`.
+    #[allow(clippy::panic)]
     pub fn slh_dsa_variant(&self) -> SlhDsaVariant {
         match self.signature {
             // Use "fast" variants for now as "small" variants may not be available
@@ -629,9 +636,11 @@ impl std::fmt::Debug for KeyPair {
 impl KeyPair {
     /// Generate a new key pair
     ///
-    /// # Panics
+    /// # Aborts
     ///
-    /// Panics if key generation fails (should never happen in practice).
+    /// Aborts the process if the OS CSPRNG-backed key generation fails — an
+    /// unrecoverable security invariant, mirroring [`random_bytes`]. (This
+    /// cannot happen in practice.)
     #[must_use]
     pub fn generate(suite: CipherSuite) -> Self {
         // Generate signature key pair based on suite type
@@ -639,13 +648,13 @@ impl KeyPair {
             let slh_dsa = SlhDsa::new(suite.slh_dsa_variant());
             let (public, secret) = slh_dsa
                 .generate_keypair()
-                .expect("SLH-DSA key generation should not fail");
+                .unwrap_or_else(|_| std::process::abort());
             SignatureKey::SlhDsa { secret, public }
         } else {
             let ml_dsa = MlDsa::new(suite.ml_dsa_variant());
             let (public, secret) = ml_dsa
                 .generate_keypair()
-                .expect("ML-DSA key generation should not fail");
+                .unwrap_or_else(|_| std::process::abort());
             SignatureKey::MlDsa { secret, public }
         };
 
@@ -653,7 +662,7 @@ impl KeyPair {
         let ml_kem = MlKem::new(suite.ml_kem_variant());
         let (kem_public, kem_secret) = ml_kem
             .generate_keypair()
-            .expect("ML-KEM key generation should not fail");
+            .unwrap_or_else(|_| std::process::abort());
 
         Self {
             signature_key,
@@ -691,6 +700,9 @@ impl KeyPair {
 
     /// Get ML-DSA public key (for backward compatibility, panics if using SLH-DSA)
     #[must_use]
+    // Intentional misuse guard; use `verifying_key_bytes()` for the
+    // suite-agnostic form. No production caller hits the SLH-DSA arm.
+    #[allow(clippy::panic)]
     pub fn verifying_key(&self) -> &MlDsaPublicKey {
         match &self.signature_key {
             SignatureKey::MlDsa { public, .. } => public,

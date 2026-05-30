@@ -158,6 +158,9 @@ impl MemberIdentity {
     }
 
     /// Get a reference to the ML-DSA signing key if available (panics for SLH-DSA)
+    // Intentional misuse guard; no production caller uses this on an SLH-DSA
+    // identity (signing goes through `sign()`, which handles both families).
+    #[allow(clippy::panic)]
     pub fn signing_key(&self) -> Option<&MlDsaSecretKey> {
         self.signing_key.as_deref().map(|key| match key {
             SecretSignatureKey::MlDsa(k) => k,

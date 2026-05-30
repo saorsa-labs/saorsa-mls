@@ -175,7 +175,7 @@ impl GroupManager {
 
             groups
                 .remove(group_id)
-                .expect("group must still exist after prior lookup")
+                .ok_or_else(|| MlsError::InvalidGroupState("group not found".to_string()))?
             // Lock is released here when `groups` goes out of scope
         };
 
@@ -232,7 +232,7 @@ impl GroupManager {
 
             groups
                 .remove(group_id)
-                .expect("group must still exist after prior lookup")
+                .ok_or_else(|| MlsError::InvalidGroupState("group not found".to_string()))?
             // Lock is released here when `groups` goes out of scope
         };
 

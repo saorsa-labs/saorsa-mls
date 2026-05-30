@@ -51,6 +51,43 @@ use crate::{
 use saorsa_pqc::api::{MlDsaSignature, SlhDsaSignature};
 use serde::{Deserialize, Serialize};
 
+/// Sliding replay window over per-sender message generations (64-slot).
+#[derive(Clone, Debug, Default)]
+struct ReplayWindow {
+    max_seen: u64,
+    window: u64,
+}
+
+impl ReplayWindow {
+    /// Accept `seq` if new within the window and mark it seen; reject replays.
+    fn allow_and_update(&mut self, seq: u64) -> bool {
+        if seq > self.max_seen {
+            let shift = seq - self.max_seen;
+            if shift >= 64 {
+                self.window = 0;
+            } else {
+                self.window <<= shift;
+            }
+            self.window |= 1;
+            self.max_seen = seq;
+            true
+        } else {
+            let offset = self.max_seen - seq;
+            if offset >= 64 {
+                false
+            } else {
+                let mask = 1u64 << offset;
+                if self.window & mask != 0 {
+                    false
+                } else {
+                    self.window |= mask;
+                    true
+                }
+            }
+        }
+    }
+}
+
 /// A real `TreeKEM` group as seen by one member.
 pub struct TreeKemGroup {
     suite: CipherSuite,
@@ -61,6 +98,9 @@ pub struct TreeKemGroup {
     epoch_secrets: EpochSecrets,
     /// Monotonic per-epoch send counter (reset each epoch).
     send_generation: u32,
+    /// Per-sender (leaf) received-generation replay windows for the current
+    /// epoch; cleared on every epoch change.
+    recv_windows: std::collections::HashMap<u32, ReplayWindow>,
 }
 
 impl std::fmt::Debug for TreeKemGroup {
@@ -138,6 +178,8 @@ pub struct TreeKemGroupSnapshot {
     path_secrets: Vec<(u32, Vec<u8>)>,
     epoch_secrets: EpochSecretsSnapshot,
     send_generation: u32,
+    /// Per-sender replay windows as `(leaf, max_seen, window)`.
+    recv_windows: Vec<(u32, u64, u64)>,
 }
 
 impl std::fmt::Debug for TreeKemGroupSnapshot {
@@ -201,6 +243,7 @@ impl TreeKemGroup {
             tree,
             epoch_secrets,
             send_generation: 0,
+            recv_windows: std::collections::HashMap::new(),
         })
     }
 
@@ -230,22 +273,24 @@ impl TreeKemGroup {
                 "new member key package self-signature is invalid".into(),
             ));
         }
-        let new_leaf = self.tree.add_leaf(new_member.clone())?;
-        let committer_leaf = self
-            .tree
+        // Work on a clone; the live group is only mutated once every fallible
+        // step below (rotation, signing, sealing, key schedule) has succeeded.
+        let mut tree = self.tree.clone();
+        let new_leaf = tree.add_leaf(new_member.clone())?;
+        let committer_leaf = tree
             .own_leaf()
             .ok_or_else(|| MlsError::InvalidGroupState("committer owns no leaf".into()))?;
 
         // UpdatePath rooted at the committer; bound to the current (pre-commit)
         // group + epoch as AAD so existing members decrypt under a shared context.
         let path_aad = Self::path_context(&self.group_id, self.epoch);
-        let (update_path, commit_secret) = self.tree.generate_update_path(&path_aad, None)?;
+        let (update_path, commit_secret) = tree.generate_update_path(&path_aad, None)?;
 
         let new_epoch = self.epoch + 1;
         let added = vec![(new_leaf, new_member.clone())];
         // Tree hash after the rotation (includes parent hashes) — bound into
         // both the commit signature and the key-schedule group context.
-        let new_tree_hash = self.tree.tree_hash()?;
+        let new_tree_hash = tree.tree_hash()?;
 
         // Commit for existing members (they add the leaf, then process the path).
         let commit_tbs = Self::commit_tbs(
@@ -280,7 +325,7 @@ impl TreeKemGroup {
         let seal_aad = Self::path_context(&self.group_id, new_epoch);
         let encrypted_joiner =
             treekem::seal_to(self.suite, &new_member.agreement_key, &joiner, &seal_aad)?;
-        let public_nodes = self.tree.export_public_nodes();
+        let public_nodes = tree.export_public_nodes();
         let welcome_tbs = Self::welcome_tbs(
             &self.group_id,
             new_epoch,
@@ -300,9 +345,12 @@ impl TreeKemGroup {
             signature: welcome_signature,
         };
 
+        // All fallible work succeeded — commit the new state atomically.
+        self.tree = tree;
         self.epoch_secrets = new_epoch_secrets;
         self.epoch = new_epoch;
         self.send_generation = 0;
+        self.recv_windows.clear();
         Ok((commit, welcome))
     }
 
@@ -380,6 +428,7 @@ impl TreeKemGroup {
             tree,
             epoch_secrets,
             send_generation: 0,
+            recv_windows: std::collections::HashMap::new(),
         })
     }
 
@@ -417,18 +466,20 @@ impl TreeKemGroup {
     /// Build, apply, and sign a commit that optionally removes `removed_leaves`
     /// and rotates the committer's direct path.
     fn make_commit(&mut self, removed_leaves: Vec<u32>) -> Result<TreeKemCommit> {
+        // Work on a clone; only swap into the live group after all fallible work
+        // (blanking, rotation, signing, key schedule) has succeeded.
+        let mut tree = self.tree.clone();
         for &leaf in &removed_leaves {
-            self.tree.blank_leaf(leaf)?;
+            tree.blank_leaf(leaf)?;
         }
-        let committer_leaf = self
-            .tree
+        let committer_leaf = tree
             .own_leaf()
             .ok_or_else(|| MlsError::InvalidGroupState("committer owns no leaf".into()))?;
         let path_aad = Self::path_context(&self.group_id, self.epoch);
-        let (update_path, commit_secret) = self.tree.generate_update_path(&path_aad, None)?;
+        let (update_path, commit_secret) = tree.generate_update_path(&path_aad, None)?;
 
         let new_epoch = self.epoch + 1;
-        let new_tree_hash = self.tree.tree_hash()?;
+        let new_tree_hash = tree.tree_hash()?;
         let tbs = Self::commit_tbs(
             &self.group_id,
             new_epoch,
@@ -441,9 +492,14 @@ impl TreeKemGroup {
         let signature = self.identity.sign(&tbs)?.to_bytes();
 
         let new_ctx = Self::group_context(&self.group_id, new_epoch, &new_tree_hash);
-        self.epoch_secrets = self.epoch_secrets.next(&commit_secret, &new_ctx)?;
+        let new_epoch_secrets = self.epoch_secrets.next(&commit_secret, &new_ctx)?;
+
+        // All fallible work succeeded — commit the new state atomically.
+        self.tree = tree;
+        self.epoch_secrets = new_epoch_secrets;
         self.epoch = new_epoch;
         self.send_generation = 0;
+        self.recv_windows.clear();
         Ok(TreeKemCommit {
             epoch: new_epoch,
             committer_leaf,
@@ -476,6 +532,14 @@ impl TreeKemGroup {
         if commit.committer_leaf >= self.tree.leaf_capacity() {
             return Err(MlsError::InvalidMessage(
                 "commit committer leaf out of range".into(),
+            ));
+        }
+        // The UpdatePath must rotate the SAME leaf that signed the commit; a
+        // mismatch would let a member (signing as itself) rotate another
+        // member's leaf/path. The signature only authenticates `committer_leaf`.
+        if commit.update_path.leaf_index != commit.committer_leaf {
+            return Err(MlsError::InvalidMessage(
+                "commit update_path leaf does not match committer leaf".into(),
             ));
         }
         if commit.removed_leaves.contains(&commit.committer_leaf) {
@@ -555,6 +619,7 @@ impl TreeKemGroup {
         self.epoch_secrets = new_epoch_secrets;
         self.epoch = new_epoch;
         self.send_generation = 0;
+        self.recv_windows.clear();
         Ok(())
     }
 
@@ -606,11 +671,16 @@ impl TreeKemGroup {
 
     /// Verify and decrypt an application message from another member.
     ///
+    /// Takes `&mut self` to record the sender's message generation for replay
+    /// protection: a generation already seen from that sender in the current
+    /// epoch is rejected. Replay state is per-epoch (cleared on epoch change)
+    /// and is captured in [`Self::to_snapshot`].
+    ///
     /// # Errors
     ///
     /// Returns [`MlsError`] on epoch mismatch, unknown sender, invalid
-    /// signature, or AEAD failure.
-    pub fn decrypt_message(&self, message: &ApplicationCiphertext) -> Result<Vec<u8>> {
+    /// signature, AEAD failure, or a replayed generation.
+    pub fn decrypt_message(&mut self, message: &ApplicationCiphertext) -> Result<Vec<u8>> {
         if message.epoch != self.epoch {
             return Err(MlsError::InvalidEpoch {
                 expected: self.epoch,
@@ -622,7 +692,7 @@ impl TreeKemGroup {
         })?;
 
         // verify the sender's signature over the full envelope
-        let signature = self.reconstruct_signature(&message.signature)?;
+        let signature = Self::reconstruct_signature_for(self.suite, &message.signature)?;
         let tbs = Self::message_tbs(
             &self.group_id,
             message.epoch,
@@ -639,7 +709,22 @@ impl TreeKemGroup {
             .application_key_and_nonce(message.sender_leaf, message.generation)?;
         let cipher = AeadCipher::new(key.to_vec(), self.suite)?;
         let aad = self.message_aad(message.sender_leaf, message.generation);
-        cipher.decrypt(&nonce, &message.ciphertext, &aad)
+        let plaintext = cipher.decrypt(&nonce, &message.ciphertext, &aad)?;
+
+        // Replay protection: reject a generation already accepted from this
+        // sender in this epoch. Done only after authentication succeeds.
+        if !self
+            .recv_windows
+            .entry(message.sender_leaf)
+            .or_default()
+            .allow_and_update(u64::from(message.generation))
+        {
+            return Err(MlsError::ProtocolError(
+                "replayed message generation".into(),
+            ));
+        }
+
+        Ok(plaintext)
     }
 
     /// MLS exporter for this epoch (RFC 9420 §8.5).
@@ -666,6 +751,11 @@ impl TreeKemGroup {
             path_secrets,
             epoch_secrets: self.epoch_secrets.snapshot(),
             send_generation: self.send_generation,
+            recv_windows: self
+                .recv_windows
+                .iter()
+                .map(|(&leaf, w)| (leaf, w.max_seen, w.window))
+                .collect(),
         }
     }
 
@@ -718,6 +808,11 @@ impl TreeKemGroup {
             tree,
             epoch_secrets,
             send_generation: snapshot.send_generation,
+            recv_windows: snapshot
+                .recv_windows
+                .into_iter()
+                .map(|(leaf, max_seen, window)| (leaf, ReplayWindow { max_seen, window }))
+                .collect(),
         })
     }
 
@@ -755,10 +850,6 @@ impl TreeKemGroup {
     #[must_use]
     pub fn member_count(&self) -> u32 {
         self.tree.active_leaf_count()
-    }
-
-    fn reconstruct_signature(&self, bytes: &[u8]) -> Result<Signature> {
-        Self::reconstruct_signature_for(self.suite, bytes)
     }
 
     fn reconstruct_signature_for(suite: CipherSuite, bytes: &[u8]) -> Result<Signature> {
@@ -1002,7 +1093,7 @@ mod tests {
         let bob = identity(suite);
         let mut alice_group = TreeKemGroup::create(b"room".to_vec(), alice).unwrap();
         let (_commit, welcome) = alice_group.add_member(&bob.key_package).unwrap();
-        let bob_group = TreeKemGroup::from_welcome(&welcome, bob).unwrap();
+        let mut bob_group = TreeKemGroup::from_welcome(&welcome, bob).unwrap();
 
         let mut ct = alice_group.encrypt_message(b"secret").unwrap();
         // Flip a ciphertext byte (after the 12-byte nonce): signature must fail.
@@ -1163,7 +1254,7 @@ mod tests {
 
         let welcome_bytes = postcard::to_stdvec(&welcome).unwrap();
         let welcome_wire: TreeKemWelcome = postcard::from_bytes(&welcome_bytes).unwrap();
-        let bob_group = TreeKemGroup::from_welcome(&welcome_wire, bob).unwrap();
+        let mut bob_group = TreeKemGroup::from_welcome(&welcome_wire, bob).unwrap();
 
         let ct = alice_group.encrypt_message(b"over the wire").unwrap();
         let ct_bytes = postcard::to_stdvec(&ct).unwrap();
@@ -1243,7 +1334,7 @@ mod tests {
 
         let mut a2 = TreeKemGroup::create(b"group-B".to_vec(), alice).unwrap();
         let (_c2, w2) = a2.add_member(&bob.key_package).unwrap();
-        let b2 = TreeKemGroup::from_welcome(&w2, bob).unwrap();
+        let mut b2 = TreeKemGroup::from_welcome(&w2, bob).unwrap();
 
         let msg_from_a1 = a1.encrypt_message(b"group A secret").unwrap();
         // Deliver a group-A message into the group-B instance.
@@ -1265,7 +1356,7 @@ mod tests {
 
     #[test]
     fn test_sender_leaf_spoofing_rejected() {
-        let (mut alice_group, bob_group, _bob) = two_member_group();
+        let (mut alice_group, mut bob_group, _bob) = two_member_group();
         let mut msg = alice_group.encrypt_message(b"from alice").unwrap();
         // Claim the message came from Bob's leaf (1) instead of Alice's (0).
         msg.sender_leaf = 1;
@@ -1300,6 +1391,61 @@ mod tests {
             bob_group.epoch(),
             1,
             "rejected commit must not advance epoch"
+        );
+    }
+
+    #[test]
+    fn test_commit_path_leaf_must_match_committer() {
+        // A commit signed as one member but whose UpdatePath rotates a different
+        // leaf must be rejected (review finding #1).
+        let (mut alice_group, mut bob_group, _bob) = two_member_group();
+        let mut commit = alice_group.update().unwrap();
+        // Point the UpdatePath at a different leaf than the (signed) committer.
+        commit.update_path.leaf_index = 1;
+        assert!(bob_group.process_commit(&commit).is_err());
+        assert_eq!(
+            bob_group.epoch(),
+            1,
+            "rejected commit must not advance epoch"
+        );
+    }
+
+    #[test]
+    fn test_application_message_replay_rejected() {
+        // The same ciphertext must not be accepted twice within an epoch.
+        let (mut alice_group, mut bob_group, _bob) = two_member_group();
+        let ct = alice_group.encrypt_message(b"once").unwrap();
+        assert_eq!(bob_group.decrypt_message(&ct).unwrap(), b"once");
+        assert!(
+            matches!(
+                bob_group.decrypt_message(&ct),
+                Err(MlsError::ProtocolError(_))
+            ),
+            "replaying a message generation must be rejected"
+        );
+        // A fresh message (new generation) is still accepted.
+        let ct2 = alice_group.encrypt_message(b"twice").unwrap();
+        assert_eq!(bob_group.decrypt_message(&ct2).unwrap(), b"twice");
+    }
+
+    #[test]
+    fn test_replay_window_survives_snapshot() {
+        // Replay state is captured in the snapshot, so a restored group still
+        // rejects a replay of a pre-snapshot message.
+        let suite = CipherSuite::default();
+        let alice = identity(suite);
+        let bob = identity(suite);
+        let mut alice_group = TreeKemGroup::create(b"room".to_vec(), alice).unwrap();
+        let (_c, w) = alice_group.add_member(&bob.key_package).unwrap();
+        let mut bob_group = TreeKemGroup::from_welcome(&w, bob.clone()).unwrap();
+
+        let ct = alice_group.encrypt_message(b"msg").unwrap();
+        bob_group.decrypt_message(&ct).unwrap();
+        let snapshot = bob_group.to_snapshot_bytes().unwrap();
+        let mut restored = TreeKemGroup::from_snapshot_bytes(&snapshot, bob).unwrap();
+        assert!(
+            restored.decrypt_message(&ct).is_err(),
+            "restored group must still reject a replayed message"
         );
     }
 
