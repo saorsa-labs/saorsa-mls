@@ -678,6 +678,14 @@ impl RatchetTree {
     /// a deterministic function of public state, so committer and members agree
     /// and the result is folded into [`Self::tree_hash`].
     ///
+    /// Conformance note: RFC 9420 §7.9 uses the *original* sibling tree hash (the
+    /// sibling subtree with the committer's `unmerged_leaves` filtered out); this
+    /// implementation uses the current sibling tree hash. It is fully
+    /// deterministic and identical across all in-stack members (convergence and
+    /// the signed `tree_hash_after` binding hold), and is a deliberate
+    /// simplification since IETF wire interop is out of scope (ADR-002). The
+    /// filtering rule would be required before any cross-stack interop claim.
+    ///
     /// # Errors
     ///
     /// Returns [`MlsError`] on internal tree-math/serialization failure.
