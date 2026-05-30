@@ -854,11 +854,11 @@ impl TreeKemGroup {
 
     fn reconstruct_signature_for(suite: CipherSuite, bytes: &[u8]) -> Result<Signature> {
         if suite.uses_slh_dsa() {
-            let sig = SlhDsaSignature::from_bytes(suite.slh_dsa_variant(), bytes)
+            let sig = SlhDsaSignature::from_bytes(suite.slh_dsa_variant()?, bytes)
                 .map_err(|e| MlsError::CryptoError(format!("invalid SLH-DSA signature: {e:?}")))?;
             Ok(Signature::SlhDsa(sig))
         } else {
-            let sig = MlDsaSignature::from_bytes(suite.ml_dsa_variant(), bytes)
+            let sig = MlDsaSignature::from_bytes(suite.ml_dsa_variant()?, bytes)
                 .map_err(|e| MlsError::CryptoError(format!("invalid ML-DSA signature: {e:?}")))?;
             Ok(Signature::MlDsa(sig))
         }

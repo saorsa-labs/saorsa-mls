@@ -436,14 +436,14 @@ impl MlsGroup {
                 .get_member(index)
                 .ok_or(MlsError::MemberNotFound(message.sender))?;
             MlDsaPublicKey::from_bytes(
-                self.cipher_suite.ml_dsa_variant(),
+                self.cipher_suite.ml_dsa_variant()?,
                 &member.identity.key_package.verifying_key,
             )
             .map_err(|e| {
                 MlsError::CryptoError(format!("invalid ML-DSA public key for sender: {e:?}"))
             })?
         };
-        let ml_dsa = MlDsa::new(self.cipher_suite.ml_dsa_variant());
+        let ml_dsa = MlDsa::new(self.cipher_suite.ml_dsa_variant()?);
         let signature_valid = ml_dsa
             .verify(&verifying_key, &message.ciphertext, &message.signature.0)
             .map_err(|e| MlsError::InvalidMessage(format!("invalid signature: {e:?}")))?;

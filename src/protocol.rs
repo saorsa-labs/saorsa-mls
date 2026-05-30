@@ -53,7 +53,7 @@ impl MlsMessage {
             Self::Welcome(msg) => (&msg.group_info, &msg.signature.0, msg.cipher_suite),
         };
 
-        let ml_dsa = MlDsa::new(suite_for_message.ml_dsa_variant());
+        let ml_dsa = MlDsa::new(suite_for_message.ml_dsa_variant()?);
         ml_dsa
             .verify(verifying_key, data, signature)
             .map_err(|e| MlsError::InvalidMessage(format!("invalid signature: {e:?}")))
@@ -91,7 +91,7 @@ impl HandshakeMessage {
         signing_key: &MlDsaSecretKey,
         suite: CipherSuite,
     ) -> Result<Self> {
-        let ml_dsa = MlDsa::new(suite.ml_dsa_variant());
+        let ml_dsa = MlDsa::new(suite.ml_dsa_variant()?);
         let signature = ml_dsa
             .sign(signing_key, &content)
             .map_err(|e| MlsError::CryptoError(format!("Signing failed: {e:?}")))?;
@@ -110,7 +110,7 @@ impl HandshakeMessage {
         verifying_key: &MlDsaPublicKey,
         suite: CipherSuite,
     ) -> Result<bool> {
-        let ml_dsa = MlDsa::new(suite.ml_dsa_variant());
+        let ml_dsa = MlDsa::new(suite.ml_dsa_variant()?);
         ml_dsa
             .verify(verifying_key, &self.content, &self.signature.0)
             .map_err(|e| MlsError::InvalidMessage(format!("invalid signature: {e:?}")))
@@ -328,7 +328,7 @@ impl WelcomeMessage {
 
     /// Verify the welcome message signature against the creator's public key
     pub fn verify_signature(&self, verifying_key: &MlDsaPublicKey) -> Result<bool> {
-        let ml_dsa = MlDsa::new(self.cipher_suite.ml_dsa_variant());
+        let ml_dsa = MlDsa::new(self.cipher_suite.ml_dsa_variant()?);
         ml_dsa
             .verify(verifying_key, &self.group_info, &self.signature.0)
             .map_err(|e| MlsError::InvalidMessage(format!("invalid signature: {e:?}")))
