@@ -156,7 +156,23 @@ impl MemberIdentity {
     /// Returns [`MlsError`] for an SLH-DSA suite (no seeded keygen upstream) or
     /// on crypto failure.
     pub fn from_seed(id: MemberId, suite: CipherSuite, seed: &[u8; 32]) -> Result<Self> {
-        let keypair = KeyPair::generate_from_seed(suite, seed)?;
+        use saorsa_pqc::api::kdf::HkdfSha3_256;
+        use saorsa_pqc::api::traits::Kdf;
+        use zeroize::Zeroize;
+
+        // Bind the member id and suite into the derivation so the same raw seed
+        // under a different id/suite yields different keys (avoids the footgun of
+        // `id`/`suite` looking like they contribute entropy when they would not).
+        let mut info = Vec::with_capacity(32);
+        info.extend_from_slice(b"saorsa-mls identity v1");
+        info.extend_from_slice(id.as_bytes());
+        info.extend_from_slice(&suite.id().as_u16().to_be_bytes());
+        let mut bound_seed = [0u8; 32];
+        HkdfSha3_256::derive(seed, None, &info, &mut bound_seed)
+            .map_err(|e| MlsError::CryptoError(format!("HKDF error: {e:?}")))?;
+
+        let keypair = KeyPair::generate_from_seed(suite, &bound_seed)?;
+        bound_seed.zeroize();
         let signing_key = Arc::new(match &keypair.signature_key {
             crate::crypto::SignatureKey::MlDsa { secret, .. } => {
                 SecretSignatureKey::MlDsa(secret.clone())
@@ -200,7 +216,7 @@ impl MemberIdentity {
             .kem_secret
             .as_deref()
             .ok_or_else(|| MlsError::InvalidGroupState("identity has no KEM secret".to_string()))?;
-        let snapshot = SecretIdentitySnapshot {
+        let mut snapshot = SecretIdentitySnapshot {
             id: self.id,
             name: self.name.clone(),
             credential: self.credential.clone(),
@@ -209,7 +225,14 @@ impl MemberIdentity {
             signing_key,
             kem_secret: kem.to_bytes(),
         };
-        postcard::to_stdvec(&snapshot).map_err(|e| MlsError::SerializationError(e.to_string()))
+        let bytes =
+            postcard::to_stdvec(&snapshot).map_err(|e| MlsError::SerializationError(e.to_string()));
+        // Wipe the plaintext secret buffers held in the intermediate struct; the
+        // returned bytes are the caller's responsibility to encrypt at rest.
+        use zeroize::Zeroize;
+        snapshot.signing_key.zeroize();
+        snapshot.kem_secret.zeroize();
+        bytes
     }
 
     /// Reconstruct an identity (with secret keys) from [`Self::to_secret_bytes`].
