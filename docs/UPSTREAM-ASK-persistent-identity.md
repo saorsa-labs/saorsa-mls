@@ -18,17 +18,41 @@ Both requested options shipped (additive, no breaking changes):
 - **Option A:** `MemberIdentity::to_secret_bytes()` / `from_secret_bytes()` —
   opaque, encrypt-at-rest serialization including the secret keys.
 
-Important caveat surfaced during implementation: ML-DSA signing in `saorsa-pqc`
-0.5.1 is **randomized** (`try_sign_with_rng(OsRng)`), so a re-derived identity
-reproduces the same **keys** but a different `KeyPackage`/credential
-*signature*. Leaf lookup (`RatchetTree::find_leaf`) and the snapshot owner-leaf
-check therefore match on the **stable public keys** (`verifying_key` +
-`agreement_key`), not full key-package equality; key-package integrity is still
-verified separately on tree import. This makes `from_seed`-restored and
-`from_secret_bytes`-restored identities reattach to their leaf after a restart.
+### Determinism contract (please confirm acceptance)
+
+`from_seed` delivers a **narrower** contract than the literal "same seed → same
+identity/keypackage" wording of the original ask:
+
+- **Guaranteed:** same `(id, suite, seed)` ⇒ same **signing + KEM key pairs**,
+  i.e. stable `verifying_key` and `agreement_key`. (`id`/`suite` are bound into
+  the HKDF, so the same raw seed under a different id/suite gives different keys.)
+- **NOT guaranteed:** a byte-identical `KeyPackage`. ML-DSA signing in `saorsa-pqc`
+  0.5.1 is **randomized** (`try_sign_with_rng(OsRng)`) and there is **no
+  deterministic-signing API upstream**, so the key-package/credential *signature*
+  differs on each derivation.
+
+This is sufficient for x0x's stated use (stable leaf / public-key matching for
+restart persistence and binding the leaf to the agent identity). Leaf lookup
+(`RatchetTree::find_leaf`) and the snapshot owner-leaf check match on the
+**stable public keys**, not full key-package equality; key-package integrity is
+still verified separately via `KeyPackage::verify` on tree import. If a byte-stable
+`KeyPackage` is ever required, persist it with `to_secret_bytes` instead of
+re-deriving. **Action for x0x: confirm the narrower contract is acceptable** (a
+byte-stable `KeyPackage` would require deterministic ML-DSA signing in
+`saorsa-pqc`, a separate upstream ask).
+
+### Tamper resistance for `from_secret_bytes`
+
+`from_secret_bytes` validates the imported snapshot before returning: it proves
+the reconstructed signing secret matches `key_package.verifying_key`
+(sign-then-verify), the reconstructed KEM secret matches `agreement_key`
+(encapsulate/decapsulate), and the key package + credential signatures are
+self-consistent. Mismatched or corrupted snapshots are rejected with an error.
 
 End-to-end restart (create → snapshot → drop → re-derive identity → restore →
-encrypt/decrypt with peer) is covered by tests for both options.
+encrypt/decrypt with peer) is covered by tests for both options, plus tamper tests
+for `from_secret_bytes` (mismatched signing key, mismatched KEM key, corrupted
+secret, grafted key package).
 
 ---
 *Original request below.*

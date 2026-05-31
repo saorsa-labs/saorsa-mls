@@ -143,13 +143,27 @@ impl MemberIdentity {
 
     /// Deterministically derive a member identity from a 32-byte `seed`.
     ///
+    /// # Determinism contract (read carefully)
+    ///
     /// The same `(id, suite, seed)` always yields the same signing and KEM
-    /// **keys** (and therefore the same `verifying_key`/`agreement_key`),
-    /// letting a group's owning identity be reconstructed across restarts and
-    /// bound to externally-held key material (e.g. derived from an agent's
-    /// long-term secret). Note: the `KeyPackage`/credential *signature* is not
-    /// reproducible byte-for-byte because ML-DSA signing is randomized — leaf
-    /// lookup keys off the stable public keys, not the full key package.
+    /// **key pairs** — hence the same `verifying_key` and `agreement_key`. The
+    /// `id` and `suite` are bound into the derivation, so the same raw seed under
+    /// a different `id`/`suite` produces *different* keys.
+    ///
+    /// This is **narrower** than "same seed ⇒ byte-identical `KeyPackage`": the
+    /// `KeyPackage` (and the credential it embeds) carries an ML-DSA *signature*,
+    /// and ML-DSA signing in `saorsa-pqc` is **randomized**
+    /// (`try_sign_with_rng(OsRng)`), so re-deriving an identity produces a fresh,
+    /// non-equal signature each time. There is no deterministic-signing API
+    /// upstream to make the bytes stable. Consequently the public-key material is
+    /// stable but the serialized `KeyPackage` is not. This crate accommodates that
+    /// by matching leaves on the stable public keys (`verifying_key` +
+    /// `agreement_key`) rather than full `KeyPackage` equality
+    /// (see [`crate::treekem::RatchetTree::find_leaf`] and
+    /// [`crate::treekem_group::TreeKemGroup::from_snapshot`]); key-package
+    /// integrity is still verified via [`KeyPackage::verify`] on tree import. If a
+    /// byte-stable `KeyPackage` is required, persist it via
+    /// [`Self::to_secret_bytes`] rather than re-deriving it.
     ///
     /// # Errors
     ///
@@ -259,14 +273,98 @@ impl MemberIdentity {
         let kem_secret =
             MlKemSecretKey::from_bytes(suite.ml_kem_variant(), &snapshot.kem_secret)
                 .map_err(|e| MlsError::CryptoError(format!("invalid KEM secret: {e:?}")))?;
-        Ok(Self {
+        let identity = Self {
             id: snapshot.id,
             name: snapshot.name,
             credential: snapshot.credential,
             key_package: snapshot.key_package,
             signing_key: Some(Arc::new(signing)),
             kem_secret: Some(Arc::new(kem_secret)),
-        })
+        };
+        // Reject tampered / mismatched snapshots: prove the reconstructed secret
+        // keys actually correspond to the public keys in the key package, and that
+        // the key package and credential are internally consistent.
+        identity.validate_secret_consistency()?;
+        Ok(identity)
+    }
+
+    /// Prove that the held secret keys match the public keys advertised in the
+    /// key package, and that the key package / credential are self-consistent.
+    ///
+    /// This is the integrity gate for [`Self::from_secret_bytes`]: a snapshot whose
+    /// signing secret does not match `key_package.verifying_key`, whose KEM secret
+    /// does not match `key_package.agreement_key`, or whose key package / credential
+    /// signatures do not verify, is rejected rather than silently producing an
+    /// identity that cannot sign or decrypt for its leaf.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MlsError::CryptoError`] if any consistency check fails.
+    fn validate_secret_consistency(&self) -> Result<()> {
+        use subtle::ConstantTimeEq;
+
+        // 1. Key package self-signature is valid.
+        if !self.key_package.verify()? {
+            return Err(MlsError::CryptoError(
+                "secret snapshot: key package self-signature is invalid".to_string(),
+            ));
+        }
+
+        // 2. Credential is bound to the key package's verifying key and validly signed.
+        let Credential::Basic {
+            identity,
+            signature,
+            ..
+        } = &self.credential;
+        let vk = &self.key_package.verifying_key;
+        if identity.len() < vk.len() || &identity[identity.len() - vk.len()..] != vk.as_slice() {
+            return Err(MlsError::CryptoError(
+                "secret snapshot: credential is not bound to the key package verifying key"
+                    .to_string(),
+            ));
+        }
+        if !self.key_package.verify_signature(identity, &signature.0)? {
+            return Err(MlsError::CryptoError(
+                "secret snapshot: credential signature is invalid".to_string(),
+            ));
+        }
+
+        // 3. Signing secret matches the public verifying key (fresh sign-then-verify).
+        const CHECK_MSG: &[u8] = b"saorsa-mls secret-snapshot consistency check v1";
+        let sig = self.sign(CHECK_MSG)?;
+        if !self.key_package.verify_signature(CHECK_MSG, &sig)? {
+            return Err(MlsError::CryptoError(
+                "secret snapshot: signing key does not match the key package verifying key"
+                    .to_string(),
+            ));
+        }
+
+        // 4. KEM secret matches the public agreement key (encapsulate then decapsulate).
+        use saorsa_pqc::api::{MlKem, MlKemPublicKey};
+        let suite = self.key_package.cipher_suite;
+        let kem_secret = self.kem_secret.as_deref().ok_or_else(|| {
+            MlsError::CryptoError("secret snapshot: missing KEM secret".to_string())
+        })?;
+        let ml_kem = MlKem::new(suite.ml_kem_variant());
+        let agreement_pub =
+            MlKemPublicKey::from_bytes(suite.ml_kem_variant(), &self.key_package.agreement_key)
+                .map_err(|e| {
+                    MlsError::CryptoError(format!("secret snapshot: invalid agreement key: {e:?}"))
+                })?;
+        let (ss_enc, ct) = ml_kem.encapsulate(&agreement_pub).map_err(|e| {
+            MlsError::CryptoError(format!("secret snapshot: encapsulation failed: {e:?}"))
+        })?;
+        let ss_dec = ml_kem.decapsulate(kem_secret, &ct).map_err(|e| {
+            MlsError::CryptoError(format!("secret snapshot: decapsulation failed: {e:?}"))
+        })?;
+        if !bool::from(ss_enc.to_bytes().as_ref().ct_eq(ss_dec.to_bytes().as_ref())) {
+            return Err(MlsError::CryptoError(
+                "secret snapshot: KEM secret does not match the key package agreement key"
+                    .to_string(),
+            ));
+        }
+
+        Ok(())
     }
 
     /// Create a member identity with a name
@@ -989,6 +1087,76 @@ mod tests {
         // The restored identity can sign and the original's key package verifies it.
         let sig = restored.sign(b"data").unwrap();
         assert!(identity.verify_signature(b"data", &sig));
+    }
+
+    #[test]
+    fn test_from_secret_bytes_rejects_mismatched_signing_key() {
+        // Graft a different identity's signing secret onto this snapshot: it no
+        // longer matches the key package's verifying_key and must be rejected.
+        let a = MemberIdentity::generate(MemberId::generate()).unwrap();
+        let b = MemberIdentity::generate(MemberId::generate()).unwrap();
+        let mut snap: SecretIdentitySnapshot =
+            postcard::from_bytes(&a.to_secret_bytes().unwrap()).unwrap();
+        let b_snap: SecretIdentitySnapshot =
+            postcard::from_bytes(&b.to_secret_bytes().unwrap()).unwrap();
+        snap.signing_key = b_snap.signing_key;
+        let tampered = postcard::to_stdvec(&snap).unwrap();
+        assert!(MemberIdentity::from_secret_bytes(&tampered).is_err());
+    }
+
+    #[test]
+    fn test_from_secret_bytes_rejects_mismatched_kem_key() {
+        // Graft a different identity's KEM secret: encapsulate/decapsulate against
+        // the snapshot's agreement_key yields a mismatched shared secret → reject.
+        let a = MemberIdentity::generate(MemberId::generate()).unwrap();
+        let b = MemberIdentity::generate(MemberId::generate()).unwrap();
+        let mut snap: SecretIdentitySnapshot =
+            postcard::from_bytes(&a.to_secret_bytes().unwrap()).unwrap();
+        let b_snap: SecretIdentitySnapshot =
+            postcard::from_bytes(&b.to_secret_bytes().unwrap()).unwrap();
+        snap.kem_secret = b_snap.kem_secret;
+        let tampered = postcard::to_stdvec(&snap).unwrap();
+        assert!(MemberIdentity::from_secret_bytes(&tampered).is_err());
+    }
+
+    #[test]
+    fn test_from_secret_bytes_rejects_corrupted_secret() {
+        // Corrupting the secret-key bytes must be rejected, not silently accepted.
+        let a = MemberIdentity::generate(MemberId::generate()).unwrap();
+        let mut snap: SecretIdentitySnapshot =
+            postcard::from_bytes(&a.to_secret_bytes().unwrap()).unwrap();
+        for byte in snap.signing_key.iter_mut().take(64) {
+            *byte ^= 0xFF;
+        }
+        let tampered = postcard::to_stdvec(&snap).unwrap();
+        assert!(MemberIdentity::from_secret_bytes(&tampered).is_err());
+    }
+
+    #[test]
+    fn test_from_secret_bytes_rejects_grafted_key_package() {
+        // A's secrets with B's key package: the secrets match neither B's
+        // verifying_key nor agreement_key, so it must be rejected.
+        let a = MemberIdentity::generate(MemberId::generate()).unwrap();
+        let b = MemberIdentity::generate(MemberId::generate()).unwrap();
+        let mut snap: SecretIdentitySnapshot =
+            postcard::from_bytes(&a.to_secret_bytes().unwrap()).unwrap();
+        let b_snap: SecretIdentitySnapshot =
+            postcard::from_bytes(&b.to_secret_bytes().unwrap()).unwrap();
+        snap.key_package = b_snap.key_package;
+        snap.credential = b_snap.credential;
+        let tampered = postcard::to_stdvec(&snap).unwrap();
+        assert!(MemberIdentity::from_secret_bytes(&tampered).is_err());
+    }
+
+    #[test]
+    fn test_from_seed_secret_bytes_roundtrip_validates() {
+        // A seed-derived identity must survive the secret-bytes round trip with
+        // the new consistency gate (it is internally consistent by construction).
+        let id = MemberId::generate();
+        let identity = MemberIdentity::from_seed(id, CipherSuite::default(), &[9u8; 32]).unwrap();
+        let bytes = identity.to_secret_bytes().unwrap();
+        let restored = MemberIdentity::from_secret_bytes(&bytes).unwrap();
+        assert_eq!(identity, restored);
     }
 
     #[test]
