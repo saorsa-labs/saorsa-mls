@@ -683,21 +683,57 @@ impl KeyPair {
         }
     }
 
-    /// Generate a key pair from a seed (for FIPS KATs)
+    /// Deterministically generate a combined signature + KEM key pair from
+    /// `seed`. The same `(suite, seed)` always yields the same keypair, via
+    /// `saorsa-pqc`'s FIPS-203/204 seeded keygen
+    /// (`MlKem::generate_keypair_from_seed(d, z)`,
+    /// `MlDsa::generate_keypair_from_seed(xi)`). `seed` may be any length; it is
+    /// HKDF-expanded into independent, domain-separated sub-seeds.
     ///
-    /// Note: this helper generates a *combined* signature + KEM key pair and
-    /// currently ignores the seed (it validates that key generation works with
-    /// correct sizes). Deterministic per-algorithm keygen IS available in
-    /// `saorsa-pqc` 0.5.1 via `MlKem::generate_keypair_from_seed(d, z)` and
-    /// `MlDsa::generate_keypair_from_seed(xi)`; the TreeKEM `DeriveKeyPair`
-    /// step uses those APIs directly (see the `treekem` module) rather than
-    /// this combined helper.
+    /// Note: only ML-DSA suites are deterministic — `saorsa-pqc` provides no
+    /// seeded keygen for SLH-DSA, so SLH-DSA suites return an error.
     ///
     /// # Errors
     ///
-    /// Returns error if seed is invalid or key generation fails.
-    pub fn generate_from_seed(suite: CipherSuite, _seed: &[u8]) -> Result<Self> {
-        Ok(Self::generate(suite))
+    /// Returns [`MlsError::CryptoError`] for an SLH-DSA suite or if HKDF fails.
+    pub fn generate_from_seed(suite: CipherSuite, seed: &[u8]) -> Result<Self> {
+        use saorsa_pqc::api::kdf::HkdfSha3_256;
+        use saorsa_pqc::api::traits::Kdf;
+
+        if suite.uses_slh_dsa() {
+            return Err(MlsError::CryptoError(
+                "deterministic key generation is not supported for SLH-DSA suites".to_string(),
+            ));
+        }
+
+        // Expand the seed into independent, domain-separated sub-seeds.
+        let mut sig_xi = [0u8; 32];
+        let mut kem_d = [0u8; 32];
+        let mut kem_z = [0u8; 32];
+        HkdfSha3_256::derive(seed, None, b"saorsa-mls keypair v1 ml-dsa xi", &mut sig_xi)
+            .map_err(|e| MlsError::CryptoError(format!("HKDF error: {e:?}")))?;
+        HkdfSha3_256::derive(seed, None, b"saorsa-mls keypair v1 ml-kem d", &mut kem_d)
+            .map_err(|e| MlsError::CryptoError(format!("HKDF error: {e:?}")))?;
+        HkdfSha3_256::derive(seed, None, b"saorsa-mls keypair v1 ml-kem z", &mut kem_z)
+            .map_err(|e| MlsError::CryptoError(format!("HKDF error: {e:?}")))?;
+
+        let ml_dsa = MlDsa::new(suite.ml_dsa_variant()?);
+        let (public, secret) = ml_dsa.generate_keypair_from_seed(&sig_xi);
+        let signature_key = SignatureKey::MlDsa { secret, public };
+
+        let ml_kem = MlKem::new(suite.ml_kem_variant());
+        let (kem_public, kem_secret) = ml_kem.generate_keypair_from_seed(&kem_d, &kem_z);
+
+        sig_xi.zeroize();
+        kem_d.zeroize();
+        kem_z.zeroize();
+
+        Ok(Self {
+            signature_key,
+            kem_secret,
+            kem_public,
+            suite,
+        })
     }
 
     /// Get the public verification key bytes

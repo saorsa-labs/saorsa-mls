@@ -789,10 +789,15 @@ impl TreeKemGroup {
             snapshot.own_leaf_secret,
             snapshot.path_secrets,
         )?;
-        // The restored owner leaf must carry this identity's key package.
+        // The restored owner leaf must carry this identity's public keys. Match
+        // on (verifying_key, agreement_key) — not full key-package equality — so
+        // a re-derived identity (from_seed / from_secret_bytes) matches despite
+        // ML-DSA's randomized key-package signature.
         let owner_ok = snapshot.own_leaf.is_some_and(|leaf| {
-            tree.leaf(leaf)
-                .is_some_and(|l| l.key_package == identity.key_package)
+            tree.leaf(leaf).is_some_and(|l| {
+                l.key_package.verifying_key == identity.key_package.verifying_key
+                    && l.key_package.agreement_key == identity.key_package.agreement_key
+            })
         });
         if !owner_ok {
             return Err(MlsError::InvalidGroupState(
@@ -1226,6 +1231,59 @@ mod tests {
             restored.export_secret("x", b"", 32).unwrap(),
             alice_group.export_secret("x", b"", 32).unwrap()
         );
+    }
+
+    #[test]
+    fn test_restart_via_from_seed_and_snapshot() {
+        // The x0x persistence path: a group owner re-derives its identity from a
+        // seed after restart and restores from a snapshot, then keeps
+        // communicating — proving from_seed + from_snapshot + stable-key match.
+        let suite = CipherSuite::default();
+        let alice_id = MemberId::generate();
+        let alice_seed = [11u8; 32];
+        let alice = MemberIdentity::from_seed(alice_id, suite, &alice_seed).unwrap();
+        let bob = identity(suite);
+
+        let mut alice_group = TreeKemGroup::create(b"room".to_vec(), alice).unwrap();
+        let (_c, w) = alice_group.add_member(&bob.key_package).unwrap();
+        let mut bob_group = TreeKemGroup::from_welcome(&w, bob).unwrap();
+
+        let snapshot = alice_group.to_snapshot_bytes().unwrap();
+        drop(alice_group); // simulate daemon restart
+
+        // Re-derive Alice's identity from the seed (no stored secret) and restore.
+        let alice_again = MemberIdentity::from_seed(alice_id, suite, &alice_seed).unwrap();
+        let mut alice_restored = TreeKemGroup::from_snapshot_bytes(&snapshot, alice_again).unwrap();
+
+        // Communication continues across the restart, both directions.
+        let ct = alice_restored.encrypt_message(b"after restart").unwrap();
+        assert_eq!(bob_group.decrypt_message(&ct).unwrap(), b"after restart");
+        let ct2 = bob_group.encrypt_message(b"welcome back").unwrap();
+        assert_eq!(
+            alice_restored.decrypt_message(&ct2).unwrap(),
+            b"welcome back"
+        );
+    }
+
+    #[test]
+    fn test_restart_via_secret_bytes() {
+        // Same restart, but the identity is persisted via to_secret_bytes.
+        let suite = CipherSuite::default();
+        let alice = identity(suite);
+        let alice_secret = alice.to_secret_bytes().unwrap();
+        let bob = identity(suite);
+
+        let mut alice_group = TreeKemGroup::create(b"room".to_vec(), alice).unwrap();
+        let (_c, w) = alice_group.add_member(&bob.key_package).unwrap();
+        let mut bob_group = TreeKemGroup::from_welcome(&w, bob).unwrap();
+
+        let snapshot = alice_group.to_snapshot_bytes().unwrap();
+        drop(alice_group);
+
+        let alice_again = MemberIdentity::from_secret_bytes(&alice_secret).unwrap();
+        let mut alice_restored = TreeKemGroup::from_snapshot_bytes(&snapshot, alice_again).unwrap();
+        let ct = alice_restored.encrypt_message(b"restored").unwrap();
+        assert_eq!(bob_group.decrypt_message(&ct).unwrap(), b"restored");
     }
 
     #[test]

@@ -20,6 +20,21 @@ enum SecretSignatureKey {
     SlhDsa(SlhDsaSecretKey),
 }
 
+/// Opaque, secret-bearing serialization of a [`MemberIdentity`]
+/// (see [`MemberIdentity::to_secret_bytes`]). Holds raw secret key bytes —
+/// **the caller must encrypt it at rest.** Deliberately does not derive `Debug`.
+#[derive(Serialize, Deserialize)]
+struct SecretIdentitySnapshot {
+    id: MemberId,
+    name: Option<String>,
+    credential: Credential,
+    key_package: KeyPackage,
+    /// Whether `signing_key` is an SLH-DSA (`true`) or ML-DSA (`false`) secret.
+    sig_is_slh: bool,
+    signing_key: Vec<u8>,
+    kem_secret: Vec<u8>,
+}
+
 /// Unique identifier for a group member
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MemberId(pub Uuid);
@@ -123,6 +138,111 @@ impl MemberIdentity {
             key_package,
             signing_key: Some(signing_key),
             kem_secret: Some(kem_secret),
+        })
+    }
+
+    /// Deterministically derive a member identity from a 32-byte `seed`.
+    ///
+    /// The same `(id, suite, seed)` always yields the same signing and KEM
+    /// **keys** (and therefore the same `verifying_key`/`agreement_key`),
+    /// letting a group's owning identity be reconstructed across restarts and
+    /// bound to externally-held key material (e.g. derived from an agent's
+    /// long-term secret). Note: the `KeyPackage`/credential *signature* is not
+    /// reproducible byte-for-byte because ML-DSA signing is randomized — leaf
+    /// lookup keys off the stable public keys, not the full key package.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MlsError`] for an SLH-DSA suite (no seeded keygen upstream) or
+    /// on crypto failure.
+    pub fn from_seed(id: MemberId, suite: CipherSuite, seed: &[u8; 32]) -> Result<Self> {
+        let keypair = KeyPair::generate_from_seed(suite, seed)?;
+        let signing_key = Arc::new(match &keypair.signature_key {
+            crate::crypto::SignatureKey::MlDsa { secret, .. } => {
+                SecretSignatureKey::MlDsa(secret.clone())
+            }
+            crate::crypto::SignatureKey::SlhDsa { secret, .. } => {
+                SecretSignatureKey::SlhDsa(secret.clone())
+            }
+        });
+        let kem_secret = Arc::new(keypair.kem_secret.clone());
+        let credential = Credential::new_basic(id, None, &keypair, suite)?;
+        let key_package = KeyPackage::new(keypair, credential.clone())?;
+        Ok(Self {
+            id,
+            name: None,
+            credential,
+            key_package,
+            signing_key: Some(signing_key),
+            kem_secret: Some(kem_secret),
+        })
+    }
+
+    /// Serialize this identity **including its secret keys** as opaque bytes for
+    /// persistence. The caller MUST encrypt the result at rest (mirroring the
+    /// `treekem_group::TreeKemGroupSnapshot` convention). Unlike the derived
+    /// `Serialize` impl (which drops secret keys), this round-trips a fully
+    /// usable identity that can sign commits and open Welcomes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MlsError`] if the identity has no secret keys or on
+    /// serialization failure.
+    pub fn to_secret_bytes(&self) -> Result<Vec<u8>> {
+        let signing = self.signing_key.as_deref().ok_or_else(|| {
+            MlsError::InvalidGroupState("identity has no signing key".to_string())
+        })?;
+        let (sig_is_slh, signing_key) = match signing {
+            SecretSignatureKey::MlDsa(k) => (false, k.to_bytes()),
+            SecretSignatureKey::SlhDsa(k) => (true, k.to_bytes()),
+        };
+        let kem = self
+            .kem_secret
+            .as_deref()
+            .ok_or_else(|| MlsError::InvalidGroupState("identity has no KEM secret".to_string()))?;
+        let snapshot = SecretIdentitySnapshot {
+            id: self.id,
+            name: self.name.clone(),
+            credential: self.credential.clone(),
+            key_package: self.key_package.clone(),
+            sig_is_slh,
+            signing_key,
+            kem_secret: kem.to_bytes(),
+        };
+        postcard::to_stdvec(&snapshot).map_err(|e| MlsError::SerializationError(e.to_string()))
+    }
+
+    /// Reconstruct an identity (with secret keys) from [`Self::to_secret_bytes`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MlsError`] on deserialization failure or if a secret key is
+    /// invalid for the identity's cipher suite.
+    pub fn from_secret_bytes(bytes: &[u8]) -> Result<Self> {
+        let snapshot: SecretIdentitySnapshot = postcard::from_bytes(bytes)
+            .map_err(|e| MlsError::DeserializationError(e.to_string()))?;
+        let suite = snapshot.key_package.cipher_suite;
+        let signing = if snapshot.sig_is_slh {
+            SecretSignatureKey::SlhDsa(
+                SlhDsaSecretKey::from_bytes(suite.slh_dsa_variant()?, &snapshot.signing_key)
+                    .map_err(|e| MlsError::CryptoError(format!("invalid SLH-DSA secret: {e:?}")))?,
+            )
+        } else {
+            SecretSignatureKey::MlDsa(
+                MlDsaSecretKey::from_bytes(suite.ml_dsa_variant()?, &snapshot.signing_key)
+                    .map_err(|e| MlsError::CryptoError(format!("invalid ML-DSA secret: {e:?}")))?,
+            )
+        };
+        let kem_secret =
+            MlKemSecretKey::from_bytes(suite.ml_kem_variant(), &snapshot.kem_secret)
+                .map_err(|e| MlsError::CryptoError(format!("invalid KEM secret: {e:?}")))?;
+        Ok(Self {
+            id: snapshot.id,
+            name: snapshot.name,
+            credential: snapshot.credential,
+            key_package: snapshot.key_package,
+            signing_key: Some(Arc::new(signing)),
+            kem_secret: Some(Arc::new(kem_secret)),
         })
     }
 
@@ -803,6 +923,49 @@ mod tests {
         let identity = MemberIdentity::generate(MemberId::generate()).unwrap();
         assert!(identity.name.is_none());
         assert_eq!(identity.cipher_suite(), CipherSuite::default());
+    }
+
+    #[test]
+    fn test_from_seed_is_key_deterministic() {
+        let suite = CipherSuite::default();
+        let id = MemberId::generate();
+        let seed = [42u8; 32];
+        let a = MemberIdentity::from_seed(id, suite, &seed).unwrap();
+        let b = MemberIdentity::from_seed(id, suite, &seed).unwrap();
+        // Same seed → same public keys (signature may differ; ML-DSA is randomized).
+        assert_eq!(a.key_package.verifying_key, b.key_package.verifying_key);
+        assert_eq!(a.key_package.agreement_key, b.key_package.agreement_key);
+        // A different seed → different keys.
+        let c = MemberIdentity::from_seed(id, suite, &[7u8; 32]).unwrap();
+        assert_ne!(a.key_package.verifying_key, c.key_package.verifying_key);
+        // The derived identity can sign and verify.
+        let sig = a.sign(b"msg").unwrap();
+        assert!(a.verify_signature(b"msg", &sig));
+        // Both derivations share the same signing key, so b verifies a's signature.
+        assert!(b.verify_signature(b"msg", &sig));
+    }
+
+    #[test]
+    fn test_from_seed_rejects_slh_dsa_suite() {
+        let slh = CipherSuite::from_id(
+            crate::crypto::CipherSuiteId::SPEC2_MLS_192_MLKEM1024_CHACHA20POLY1305_SHA384_SLHDSA192,
+        )
+        .unwrap();
+        assert!(MemberIdentity::from_seed(MemberId::generate(), slh, &[0u8; 32]).is_err());
+    }
+
+    #[test]
+    fn test_secret_bytes_roundtrip() {
+        let identity = MemberIdentity::generate(MemberId::generate()).unwrap();
+        let bytes = identity.to_secret_bytes().unwrap();
+        let restored = MemberIdentity::from_secret_bytes(&bytes).unwrap();
+
+        assert_eq!(identity, restored); // PartialEq covers id/name/credential/key_package
+        assert!(restored.signing_key().is_some(), "secret keys must survive");
+        assert!(restored.kem_secret().is_some());
+        // The restored identity can sign and the original's key package verifies it.
+        let sig = restored.sign(b"data").unwrap();
+        assert!(identity.verify_signature(b"data", &sig));
     }
 
     #[test]
