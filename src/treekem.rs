@@ -416,12 +416,23 @@ impl RatchetTree {
         })
     }
 
-    /// Find the leaf index whose key package equals `key_package`, if any.
+    /// Find the leaf index owned by `key_package`, matching on the **stable
+    /// public keys** (`verifying_key` + `agreement_key`) rather than full
+    /// key-package equality.
+    ///
+    /// This is deliberate: ML-DSA signing is randomized, so a re-derived or
+    /// restored identity ([`crate::member::MemberIdentity::from_seed`] /
+    /// `from_secret_bytes`) yields the same public keys but a different
+    /// key-package signature. The signed key package's own integrity is checked
+    /// separately in [`Self::from_public_nodes`]; the pair
+    /// `(verifying_key, agreement_key)` uniquely identifies a member's leaf.
     #[must_use]
     pub fn find_leaf(&self, key_package: &KeyPackage) -> Option<u32> {
         (0..self.leaf_capacity()).find(|&leaf| {
-            self.leaf(leaf)
-                .is_some_and(|data| &data.key_package == key_package)
+            self.leaf(leaf).is_some_and(|data| {
+                data.key_package.verifying_key == key_package.verifying_key
+                    && data.key_package.agreement_key == key_package.agreement_key
+            })
         })
     }
 

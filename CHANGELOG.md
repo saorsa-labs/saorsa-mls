@@ -4,6 +4,37 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.7] - 2026-05-31
+### Added — persistent / derivable TreeKEM identity (x0x upstream ask)
+- `MemberIdentity::from_seed(id, suite, &[u8; 32])`: deterministic identity
+  derivation (same seed ⇒ same keys), backed by a real
+  `KeyPair::generate_from_seed` (ML-DSA + ML-KEM seeded keygen). Lets a group's
+  owning identity be reconstructed across restarts and bound to externally-held
+  key material. ML-DSA suites only (no seeded SLH-DSA keygen upstream).
+- `MemberIdentity::to_secret_bytes()` / `from_secret_bytes()`: opaque,
+  encrypt-at-rest serialization that includes the secret keys (the derived
+  `Serialize` impl still drops them). `from_secret_bytes` **validates** that the
+  reconstructed secrets match the key package's public keys (sign-then-verify for
+  the signing key; encapsulate/decapsulate for the KEM key) and that the key
+  package / credential signatures are self-consistent, rejecting tampered or
+  mismatched snapshots instead of producing an unusable identity.
+### Changed
+- `RatchetTree::find_leaf` and `TreeKemGroup::from_snapshot` match the owner leaf
+  on the stable public keys (`verifying_key` + `agreement_key`) rather than full
+  key-package equality, so a re-derived / restored identity reattaches to its
+  leaf (ML-DSA signing is randomized, so the key-package signature is not
+  reproducible). Key-package integrity is still verified on tree import.
+- `from_seed` binds `id` + `suite` into the HKDF derivation (same raw seed under a
+  different id/suite now yields different keys), and `to_secret_bytes` zeroizes its
+  intermediate plaintext secret buffers.
+### Determinism contract (narrower than the upstream ask)
+- `from_seed` guarantees **same `(id, suite, seed)` ⇒ same signing/KEM key pairs**
+  (stable `verifying_key`/`agreement_key`), **not** a byte-identical `KeyPackage`:
+  ML-DSA signing is randomized upstream with no deterministic-signing API, so the
+  key-package/credential signature differs on each derivation. Leaf matching keys
+  off the stable public keys to accommodate this. If a byte-stable `KeyPackage` is
+  required, persist it via `to_secret_bytes` rather than re-deriving.
+
 ## [0.3.6] - 2026-05-30
 ### Added — real post-quantum TreeKEM (ADR-002)
 - `treekem`: RFC 9420-subset ratchet tree (perfect-tree math, per-node ML-KEM
