@@ -21,6 +21,8 @@
 //!   [`TreeKemGroup::process_commit`] run signed UpdatePath commits so members
 //!   heal (PCS) and advance epochs (FS); a removed member cannot derive the new
 //!   epoch.
+//! - [`TreeKemGroup::remove_members`] removes several members in one commit,
+//!   so none of the removed leaves receives key material from it.
 //! - [`TreeKemGroup::encrypt_message`] / [`TreeKemGroup::decrypt_message`]
 //!   protect application messages with per-sender/per-generation keys derived
 //!   from the epoch's `encryption_secret`, signed with the sender's identity.
@@ -208,6 +210,57 @@ pub struct ApplicationCiphertext {
     pub ciphertext: Vec<u8>,
     /// Signature over `ciphertext` by the sender's identity key.
     pub signature: Vec<u8>,
+}
+
+/// Why a list of leaves cannot be removed in one commit.
+///
+/// Returned by [`TreeKemGroup::remove_members`] (producer side, inside
+/// [`RemoveMembersError::Invalid`]) and by
+/// [`TreeKemGroup::check_commit_removals`] (receiver side).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum RemovalError {
+    /// The removal list is empty (producer side only; a received commit with
+    /// no removals is an update).
+    #[error("no leaves to remove")]
+    Empty,
+    /// The leaf is listed more than once.
+    #[error("leaf {0} is listed more than once")]
+    Duplicate(u32),
+    /// The leaf index is outside the tree.
+    #[error("leaf {0} is out of range")]
+    OutOfRange(u32),
+    /// The leaf is blank (not a current member).
+    #[error("leaf {0} is blank")]
+    BlankLeaf(u32),
+    /// The leaf is the committer's own leaf.
+    #[error("leaf {0} is the committer's own leaf")]
+    CommitterLeaf(u32),
+}
+
+/// Error from [`TreeKemGroup::remove_members`].
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum RemoveMembersError {
+    /// The removal list was rejected before any work was done; the group is
+    /// unchanged.
+    #[error("invalid removal list: {0}")]
+    Invalid(#[from] RemovalError),
+    /// Building the commit failed (crypto or tree error); the group is
+    /// unchanged.
+    #[error(transparent)]
+    Mls(#[from] MlsError),
+}
+
+impl From<RemoveMembersError> for MlsError {
+    fn from(e: RemoveMembersError) -> Self {
+        match e {
+            RemoveMembersError::Invalid(r) => {
+                MlsError::InvalidGroupState(format!("invalid removal list: {r}"))
+            }
+            RemoveMembersError::Mls(m) => m,
+        }
+    }
 }
 
 impl TreeKemGroup {
@@ -463,6 +516,92 @@ impl TreeKemGroup {
         self.make_commit(vec![leaf])
     }
 
+    /// Remove several members in ONE commit.
+    ///
+    /// Every leaf in `leaves` (and its direct path) is blanked before the
+    /// committer's fresh UpdatePath is generated, so the path secrets of this
+    /// commit are sealed only to the resolution of the remaining tree: no
+    /// removed leaf receives any key material from this commit, and none of
+    /// them can derive the new epoch. Removing the same set with repeated
+    /// [`Self::remove_member`] calls is weaker: each intermediate commit still
+    /// seals its path secrets to the leaves that are removed later.
+    ///
+    /// The returned [`TreeKemCommit`] uses the existing wire form (its
+    /// `removed_leaves` field lists every removed leaf, in ascending order), so
+    /// any receiver that implements [`Self::process_commit`] applies it.
+    ///
+    /// The live group is changed only on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RemoveMembersError::Invalid`] with a typed [`RemovalError`] if
+    /// `leaves` is empty, lists a leaf twice, names an out-of-range or blank
+    /// leaf, or names this member's own leaf; returns
+    /// [`RemoveMembersError::Mls`] on a crypto/tree failure.
+    pub fn remove_members(
+        &mut self,
+        leaves: &[u32],
+    ) -> std::result::Result<TreeKemCommit, RemoveMembersError> {
+        if leaves.is_empty() {
+            return Err(RemovalError::Empty.into());
+        }
+        let committer_leaf = self
+            .tree
+            .own_leaf()
+            .ok_or_else(|| MlsError::InvalidGroupState("committer owns no leaf".into()))?;
+        self.check_removal_list(committer_leaf, leaves)?;
+        let mut sorted = leaves.to_vec();
+        sorted.sort_unstable();
+        Ok(self.make_commit(sorted)?)
+    }
+
+    /// Check the `removed_leaves` list of a received commit against this
+    /// member's current tree, without changing any state.
+    ///
+    /// [`Self::process_commit`] runs the same check (and returns
+    /// [`MlsError::InvalidMessage`] on failure); this method exposes the typed
+    /// reason for callers that want it. An empty list is valid here: a commit
+    /// that removes nobody is an update.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`RemovalError`] if a removed leaf is listed twice, is out of
+    /// range, is blank, or is the commit's own committer leaf.
+    pub fn check_commit_removals(
+        &self,
+        commit: &TreeKemCommit,
+    ) -> std::result::Result<(), RemovalError> {
+        if commit.removed_leaves.is_empty() {
+            return Ok(());
+        }
+        self.check_removal_list(commit.committer_leaf, &commit.removed_leaves)
+    }
+
+    /// Shared structural check of a removal list against the current tree.
+    fn check_removal_list(
+        &self,
+        committer_leaf: u32,
+        leaves: &[u32],
+    ) -> std::result::Result<(), RemovalError> {
+        let capacity = self.tree.leaf_capacity();
+        let mut seen = std::collections::BTreeSet::new();
+        for &leaf in leaves {
+            if !seen.insert(leaf) {
+                return Err(RemovalError::Duplicate(leaf));
+            }
+            if leaf == committer_leaf {
+                return Err(RemovalError::CommitterLeaf(leaf));
+            }
+            if leaf >= capacity {
+                return Err(RemovalError::OutOfRange(leaf));
+            }
+            if self.tree.leaf(leaf).is_none() {
+                return Err(RemovalError::BlankLeaf(leaf));
+            }
+        }
+        Ok(())
+    }
+
     /// Build, apply, and sign a commit that optionally removes `removed_leaves`
     /// and rotates the committer's direct path.
     fn make_commit(&mut self, removed_leaves: Vec<u32>) -> Result<TreeKemCommit> {
@@ -547,6 +686,10 @@ impl TreeKemGroup {
                 "commit cannot remove its own committer".into(),
             ));
         }
+        // Structural check of the removal list (duplicates, range, blank
+        // leaves) before any signature work or state change.
+        self.check_commit_removals(commit)
+            .map_err(|e| MlsError::InvalidMessage(format!("invalid commit removal list: {e}")))?;
 
         // Authenticate the committer before touching any state.
         let tbs = Self::commit_tbs(
@@ -1602,3 +1745,7 @@ mod tests {
         assert!(bob_group.process_commit(&commit).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "treekem_group_multi_remove_tests.rs"]
+mod multi_remove_tests;

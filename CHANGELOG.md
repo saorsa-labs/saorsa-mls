@@ -4,6 +4,32 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.9] - 2026-11-22
+### Added — remove several members in one TreeKEM commit
+- `TreeKemGroup::remove_members(&[u32])`: one signed commit that blanks every
+  listed leaf (and its direct path) before the committer's fresh UpdatePath is
+  generated. Path secrets are sealed only to the remaining tree, so no removed
+  leaf receives key material from the commit and none can derive the new epoch.
+  (Repeated `remove_member` calls seal each intermediate commit to the leaves
+  removed later.) The commit lists the removed leaves in ascending order.
+- Typed errors: `RemovalError` (`Empty`, `Duplicate`, `OutOfRange`,
+  `BlankLeaf`, `CommitterLeaf`) and `RemoveMembersError` (`Invalid`, `Mls`),
+  with `From<RemoveMembersError> for MlsError`.
+- `TreeKemGroup::check_commit_removals(&TreeKemCommit)`: the receiver-side
+  check of a commit's removal list, returning the typed `RemovalError`.
+### Changed
+- `TreeKemGroup::process_commit` checks the removal list (duplicates, range,
+  blank leaves) before the signature check and any state change, and returns
+  `MlsError::InvalidMessage` on failure. Before, a duplicate, out-of-range or
+  blank removed leaf in a validly signed commit failed later with
+  `MlsError::TreeKemError`. Commits from `remove_member`, `update` and
+  `add_member` are not affected.
+### Wire compatibility
+- No wire or snapshot format change. `TreeKemCommit` already carried a list of
+  removed leaves and receivers already applied every entry; saorsa-mls 0.3.8
+  receivers apply a multi-remove commit and reach the same epoch secret
+  (cross-version tests in `tests/multi_remove_wire_compat.rs`).
+
 ## [0.3.7] - 2026-05-31
 ### Added — persistent / derivable TreeKEM identity (x0x upstream ask)
 - `MemberIdentity::from_seed(id, suite, &[u8; 32])`: deterministic identity
