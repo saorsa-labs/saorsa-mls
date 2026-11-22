@@ -1,6 +1,6 @@
 [package]
 name = "saorsa-mls"
-version = "0.3.8"
+version = "0.3.9"
 edition = "2021"
 rust-version = "1.88.0"
 authors = ["Saorsa Labs Limited <saorsalabs@gmail.com>"]
@@ -70,6 +70,9 @@ quickcheck_macros = "1.0"
 pretty_assertions = "1.4"
 tokio-test = "0.4"
 hex = "0.4"
+# Published 0.3.8 (the line x0x pins): cross-version wire tests in
+# tests/multi_remove_wire_compat.rs.
+saorsa-mls-v038 = { package = "saorsa-mls", version = "=0.3.8" }
 
 [features]
 default = []
