@@ -1,13 +1,12 @@
 [package]
 name = "saorsa-mls"
-version = "0.3.9"
+version = "0.3.10"
 edition = "2021"
 rust-version = "1.88.0"
 authors = ["Saorsa Labs Limited <saorsalabs@gmail.com>"]
 license = "MIT OR Apache-2.0"
 description = "Experimental Message Layer Security (MLS)-inspired library for P2P secure group communication"
 repository = "https://github.com/saorsa-labs/saorsa-mls"
-homepage = "https://github.com/saorsa-labs/saorsa-mls"
 documentation = "https://docs.rs/saorsa-mls"
 readme = "README.md"
 keywords = ["mls", "encryption", "group", "forward-secrecy", "p2p"]
