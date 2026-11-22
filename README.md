@@ -50,7 +50,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-saorsa-mls = "0.1.0"
+saorsa-mls = "0.3.10"
 ```
 
 ### Basic example

@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.10] - 2026-11-22
+### Changed
+Release-only: fixes the manifest warning that blocked the 0.3.9 release workflow.
+0.3.9 was tagged but never published; 0.3.10 carries the same code (multi-remove
+TreeKEM commit). The `homepage` field in Cargo.toml was removed because it was
+redundant with `repository`, causing `cargo::redundant_homepage` to fire on every
+`cargo` invocation and failing the doc-validation step of the release workflow.
+
 ## [0.3.9] - 2026-11-22
 ### Added — remove several members in one TreeKEM commit
 - `TreeKemGroup::remove_members(&[u32])`: one signed commit that blanks every
